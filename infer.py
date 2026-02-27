@@ -100,6 +100,24 @@ def main() -> None:
         default=30.0,
         help="Maximum reference duration in seconds. Set <=0 to disable the cap.",
     )
+    parser.add_argument(
+        "--ref-normalize-db",
+        type=float,
+        default=None,
+        help=(
+            "Optional target loudness (dB/LUFS-like) for reference audio before DACVAE encode "
+            "(e.g. -16.0). Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--ref-ensure-max",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Scale reference audio down only when peak exceeds 1.0 after optional loudness "
+            "normalization (DACVAE-like ensure_max behavior)."
+        ),
+    )
     parser.add_argument("--codec-repo", default="facebook/dacvae-watermarked")
     parser.add_argument(
         "--max-text-len",
@@ -289,6 +307,10 @@ def main() -> None:
             ref_wav=args.ref_wav,
             ref_latent=args.ref_latent,
             no_ref=bool(args.no_ref),
+            ref_normalize_db=None
+            if args.ref_normalize_db is None
+            else float(args.ref_normalize_db),
+            ref_ensure_max=bool(args.ref_ensure_max),
             num_candidates=int(args.num_candidates),
             decode_mode=str(args.decode_mode),
             seconds=FIXED_SECONDS,

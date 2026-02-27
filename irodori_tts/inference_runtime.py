@@ -166,6 +166,8 @@ class SamplingRequest:
     ref_wav: str | None = None
     ref_latent: str | None = None
     no_ref: bool = False
+    ref_normalize_db: float | None = None
+    ref_ensure_max: bool = False
     num_candidates: int = 1
     decode_mode: str = "sequential"
     seconds: float = 30.0
@@ -511,7 +513,18 @@ class InferenceRuntime:
                         f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
                     )
                     wav = wav[:, :max_ref_samples]
-            ref_latent = self.codec.encode_waveform(wav.unsqueeze(0), sample_rate=int(sr)).cpu()
+            if req.ref_normalize_db is not None:
+                messages.append(
+                    f"info: reference loudness normalize enabled (target_db={float(req.ref_normalize_db):.2f})."
+                )
+            if req.ref_ensure_max:
+                messages.append("info: reference peak safety scaling enabled (ensure_max=True).")
+            ref_latent = self.codec.encode_waveform(
+                wav.unsqueeze(0),
+                sample_rate=int(sr),
+                normalize_db=req.ref_normalize_db,
+                ensure_max=bool(req.ref_ensure_max),
+            ).cpu()
 
         if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
             messages.append(

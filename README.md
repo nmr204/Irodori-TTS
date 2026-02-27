@@ -95,6 +95,8 @@ uv run python infer.py \
 | `--ref-wav` | None | Reference audio for voice cloning |
 | `--ref-latent` | None | Pre-computed reference latent (.pt) |
 | `--no-ref` | False | Unconditional generation (no reference) |
+| `--ref-normalize-db` | None | Optional reference loudness target before DACVAE encode (e.g. `-16`) |
+| `--ref-ensure-max` | False | Scale reference down only when peak exceeds 1.0 after optional normalization |
 | `--num-steps` | 40 | Number of Euler integration steps |
 | `--cfg-scale-text` | 3.0 | CFG scale for text conditioning |
 | `--cfg-scale-speaker` | 5.0 | CFG scale for speaker conditioning |

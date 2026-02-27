@@ -186,6 +186,7 @@ def _run_generation(
     truncation_factor_raw: str,
     rescale_k_raw: str,
     rescale_sigma_raw: str,
+    normalize_ref_audio: bool,
     speaker_kv_scale_raw: str,
     speaker_kv_min_t_raw: str,
     speaker_kv_max_layers_raw: str,
@@ -221,6 +222,8 @@ def _run_generation(
 
     ref_wav = _resolve_ref_wav(uploaded_audio=uploaded_audio)
     no_ref = ref_wav is None
+    ref_normalize_db = -16.0 if bool(normalize_ref_audio) else None
+    ref_ensure_max = bool(normalize_ref_audio)
 
     runtime, reloaded = get_cached_runtime(runtime_key)
     stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
@@ -249,6 +252,8 @@ def _run_generation(
             ref_wav=ref_wav,
             ref_latent=None,
             no_ref=bool(no_ref),
+            ref_normalize_db=ref_normalize_db,
+            ref_ensure_max=bool(ref_ensure_max),
             num_candidates=requested_candidates,
             decode_mode="sequential",
             seconds=FIXED_SECONDS,
@@ -364,10 +369,17 @@ def build_ui() -> gr.Blocks:
             clear_cache_msg = gr.Textbox(label="Model Status", interactive=False)
 
         text = gr.Textbox(label="Text", lines=4)
-        uploaded_audio = gr.Audio(
-            label="Reference Audio Upload (optional, blank = no-reference mode)",
-            type="filepath",
-        )
+        with gr.Row():
+            uploaded_audio = gr.Audio(
+                label="Reference Audio Upload (optional, blank = no-reference mode)",
+                type="filepath",
+                scale=4,
+            )
+            with gr.Column(scale=1):
+                normalize_ref_audio = gr.Checkbox(
+                    label="Normalize Ref Audio (-16 LUFS + ensure max)",
+                    value=False,
+                )
 
         with gr.Accordion("Sampling", open=True):
             with gr.Row():
@@ -466,6 +478,7 @@ def build_ui() -> gr.Blocks:
                 truncation_factor_raw,
                 rescale_k_raw,
                 rescale_sigma_raw,
+                normalize_ref_audio,
                 speaker_kv_scale_raw,
                 speaker_kv_min_t_raw,
                 speaker_kv_max_layers_raw,

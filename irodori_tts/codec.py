@@ -105,10 +105,19 @@ class DACVAECodec:
         )
 
     @torch.inference_mode()
-    def encode_waveform(self, waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    def encode_waveform(
+        self,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        *,
+        normalize_db: float | None = None,
+        ensure_max: bool = False,
+    ) -> torch.Tensor:
         """
         Input:
           waveform: (B, C, T) or (C, T)
+          normalize_db: Optional target loudness (LUFS-like dB) applied before encode
+          ensure_max: If True, scale down only when abs peak exceeds 1.0
         Output:
           latent: (B, T_latent, D_latent)
         """
@@ -121,6 +130,28 @@ class DACVAECodec:
             waveform = waveform.mean(dim=1, keepdim=True)
         if sample_rate != self.sample_rate:
             waveform = torchaudio.functional.resample(waveform, sample_rate, self.sample_rate)
+
+        waveform = waveform.to(dtype=torch.float32)
+        if normalize_db is not None:
+            try:
+                loudness = torchaudio.functional.loudness(waveform, self.sample_rate)
+                if loudness.ndim == 0:
+                    loudness = loudness.unsqueeze(0)
+                gain_db = (float(normalize_db) - loudness).clamp(min=-80.0, max=80.0)
+                gain = torch.pow(
+                    torch.tensor(10.0, device=waveform.device, dtype=waveform.dtype),
+                    gain_db / 20.0,
+                ).view(-1, 1, 1)
+                finite_mask = torch.isfinite(gain)
+                waveform = torch.where(finite_mask, waveform * gain, waveform)
+            except Exception:
+                # Keep behavior robust when loudness calculation is unavailable for an input.
+                pass
+
+        if ensure_max:
+            peak = waveform.abs().amax(dim=-1, keepdim=True).amax(dim=1, keepdim=True)
+            safe_peak = peak.clamp(min=1.0)
+            waveform = waveform / safe_peak
 
         waveform = waveform.to(self.device, dtype=self.dtype)
         encoded = self.model.encode(waveform)  # (B, D, T)
