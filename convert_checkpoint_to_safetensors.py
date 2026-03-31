@@ -11,7 +11,7 @@ from typing import Any
 import torch
 from safetensors.torch import save_file
 
-from irodori_tts.config import ModelConfig
+from irodori_tts.config import ModelConfig, merge_dataclass_overrides
 from irodori_tts.inference_runtime import _load_checkpoint_for_inference
 from irodori_tts.lora import (
     LORA_METADATA_NAME,
@@ -23,7 +23,7 @@ from irodori_tts.lora import (
 from irodori_tts.model import TextToLatentRFDiT
 
 CONFIG_META_KEY = "config_json"
-INFERENCE_CONFIG_KEYS = ("max_text_len", "fixed_target_latent_steps")
+INFERENCE_CONFIG_KEYS = ("max_text_len", "max_caption_len", "fixed_target_latent_steps")
 
 
 def _default_output_path(input_path: Path) -> Path:
@@ -190,6 +190,147 @@ def _resolve_base_checkpoint(adapter_dir: Path, override: str | None) -> Path:
     return _normalize_checkpoint_path(checkpoint_path)
 
 
+def _initialize_embedding_from_pretrained(
+    embedding: torch.nn.Embedding,
+    *,
+    repo_id: str,
+) -> None:
+    try:
+        from transformers import AutoModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "transformers is required for pretrained text embedding initialization. "
+            "Install with `pip install transformers sentencepiece`."
+        ) from exc
+
+    text_backbone = AutoModel.from_pretrained(
+        repo_id,
+        trust_remote_code=False,
+        dtype=torch.float32,
+        low_cpu_mem_usage=True,
+    )
+    pretrained_embedding = text_backbone.get_input_embeddings()
+    if pretrained_embedding is None:
+        raise ValueError(f"Pretrained model has no input embeddings: {repo_id}")
+    src_weight = pretrained_embedding.weight.detach().to(device="cpu", dtype=torch.float32)
+    tgt_weight = embedding.weight
+    src_vocab, src_dim = tuple(src_weight.shape)
+    tgt_vocab, tgt_dim = tuple(tgt_weight.shape)
+    if src_dim != tgt_dim:
+        raise ValueError(
+            f"Embedding hidden size mismatch: pretrained={src_dim} model={tgt_dim} for repo={repo_id}."
+        )
+
+    copy_rows = min(src_vocab, tgt_vocab)
+    with torch.no_grad():
+        tgt_weight[:copy_rows].copy_(
+            src_weight[:copy_rows].to(device=tgt_weight.device, dtype=tgt_weight.dtype)
+        )
+
+
+def _initialize_caption_embedding_from_pretrained(
+    model: TextToLatentRFDiT,
+    model_cfg: ModelConfig,
+) -> None:
+    if model.caption_encoder is None:
+        raise RuntimeError(
+            "Caption embedding initialization requested but caption encoder is absent."
+        )
+    _initialize_embedding_from_pretrained(
+        model.caption_encoder.text_embedding,
+        repo_id=model_cfg.caption_tokenizer_repo_resolved,
+    )
+
+
+def _checkpoint_uses_caption_condition(
+    checkpoint_model_cfg: dict | None,
+    state_dict: dict[str, torch.Tensor],
+) -> bool:
+    if checkpoint_model_cfg is not None:
+        checkpoint_cfg = merge_dataclass_overrides(
+            ModelConfig(),
+            checkpoint_model_cfg,
+            section="checkpoint model_config",
+        )
+        if checkpoint_cfg.use_caption_condition:
+            return True
+    return any(
+        key.startswith("caption_encoder.")
+        or key.startswith("caption_norm.")
+        or ".wk_caption." in key
+        or ".wv_caption." in key
+        for key in state_dict
+    )
+
+
+def _is_caption_only_parameter(key: str) -> bool:
+    return (
+        key.startswith("caption_encoder.")
+        or key.startswith("caption_norm.")
+        or ".wk_caption." in key
+        or ".wv_caption." in key
+    )
+
+
+def _is_speaker_only_parameter(key: str) -> bool:
+    return (
+        key.startswith("speaker_encoder.")
+        or key.startswith("speaker_norm.")
+        or ".wk_speaker." in key
+        or ".wv_speaker." in key
+    )
+
+
+def _load_model_state_partially(
+    model: TextToLatentRFDiT,
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[list[str], list[str], list[str]]:
+    model_state = model.state_dict()
+    filtered_state: dict[str, torch.Tensor] = {}
+    skipped_shape: list[str] = []
+    skipped_extra: list[str] = []
+
+    for key, value in state_dict.items():
+        target = model_state.get(key)
+        if target is None:
+            skipped_extra.append(key)
+            continue
+        if tuple(target.shape) != tuple(value.shape):
+            skipped_shape.append(key)
+            continue
+        filtered_state[key] = value
+
+    missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
+    if unexpected_keys:
+        skipped_extra.extend(unexpected_keys)
+    return missing_keys, skipped_shape, skipped_extra
+
+
+def _validate_caption_upgrade_partial_load(
+    checkpoint_path: Path,
+    missing_keys: list[str],
+    skipped_shape: list[str],
+    skipped_extra: list[str],
+) -> None:
+    if skipped_shape:
+        raise ValueError(
+            "Checkpoint/config shape mismatch while upgrading caption conditioning: "
+            f"{checkpoint_path} skipped_shape={skipped_shape[:8]}"
+        )
+    non_speaker_extra = [key for key in skipped_extra if not _is_speaker_only_parameter(key)]
+    if non_speaker_extra:
+        raise ValueError(
+            "Unexpected checkpoint keys while upgrading caption conditioning: "
+            f"{checkpoint_path} skipped_extra={non_speaker_extra[:8]}"
+        )
+    non_caption_missing = [key for key in missing_keys if not _is_caption_only_parameter(key)]
+    if non_caption_missing:
+        raise ValueError(
+            "Partial init from caption-free checkpoint left non-caption parameters missing: "
+            f"{checkpoint_path} missing={non_caption_missing[:8]}"
+        )
+
+
 def _load_adapter_checkpoint(
     adapter_dir: Path,
     *,
@@ -197,10 +338,27 @@ def _load_adapter_checkpoint(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any], bool]:
     model_cfg, train_cfg = _load_saved_config(adapter_dir)
     base_path = _resolve_base_checkpoint(adapter_dir, base_checkpoint)
-    base_state, _, _ = _load_checkpoint_for_inference(base_path)
+    base_state, base_model_cfg, _ = _load_checkpoint_for_inference(base_path)
+    resolved_model_cfg = ModelConfig(**model_cfg)
 
-    model = TextToLatentRFDiT(ModelConfig(**model_cfg))
-    model.load_state_dict(base_state)
+    model = TextToLatentRFDiT(resolved_model_cfg)
+    checkpoint_has_caption = _checkpoint_uses_caption_condition(base_model_cfg, base_state)
+    current_has_caption = bool(resolved_model_cfg.use_caption_condition)
+    if checkpoint_has_caption and not current_has_caption:
+        raise ValueError(
+            "Caption-conditioned base checkpoint cannot initialize a caption-free adapter config."
+        )
+    if current_has_caption and not checkpoint_has_caption:
+        missing_keys, skipped_shape, skipped_extra = _load_model_state_partially(model, base_state)
+        _validate_caption_upgrade_partial_load(
+            base_path,
+            missing_keys,
+            skipped_shape,
+            skipped_extra,
+        )
+        _initialize_caption_embedding_from_pretrained(model, resolved_model_cfg)
+    else:
+        model.load_state_dict(base_state, strict=True)
     peft_model = load_lora_adapter(model, adapter_dir, is_trainable=False)
     if not hasattr(peft_model, "merge_and_unload"):
         raise RuntimeError("Loaded PEFT adapter does not support merge_and_unload().")

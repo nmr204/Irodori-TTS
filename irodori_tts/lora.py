@@ -28,6 +28,10 @@ LORA_TARGET_PRESETS: dict[str, str] = {
         r"^text_encoder\.blocks\.\d+\."
         r"(attention\.(wq|wk|wv|wo|gate)|mlp\.(w1|w2|w3))$"
     ),
+    "caption_attn_mlp": (
+        r"^caption_encoder\.blocks\.\d+\."
+        r"(attention\.(wq|wk|wv|wo|gate)|mlp\.(w1|w2|w3))$"
+    ),
     "speaker_attn_mlp": (
         r"^(speaker_encoder\.in_proj"
         r"|speaker_encoder\.blocks\.\d+\."
@@ -35,24 +39,25 @@ LORA_TARGET_PRESETS: dict[str, str] = {
     ),
     "diffusion_attn": (
         r"^blocks\.\d+\.attention\."
-        r"(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|gate)$"
+        r"(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|wk_caption|wv_caption|gate)$"
     ),
     "diffusion_attn_mlp": (
         r"^blocks\.\d+\."
-        r"(attention\.(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|gate)"
+        r"(attention\.(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|wk_caption|wv_caption|gate)"
         r"|mlp\.(w1|w2|w3))$"
     ),
     "all_attn": (
         r"^(text_encoder\.blocks\.\d+\.attention\.(wq|wk|wv|wo|gate)"
+        r"|caption_encoder\.blocks\.\d+\.attention\.(wq|wk|wv|wo|gate)"
         r"|speaker_encoder\.blocks\.\d+\.attention\.(wq|wk|wv|wo|gate)"
-        r"|blocks\.\d+\.attention\.(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|gate))$"
+        r"|blocks\.\d+\.attention\.(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|wk_caption|wv_caption|gate))$"
     ),
     "diffusion_full": (
         r"^(cond_module\.(0|2|4)"
         r"|in_proj"
         r"|out_proj"
         r"|blocks\.\d+\."
-        r"(attention\.(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|gate)"
+        r"(attention\.(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|wk_caption|wv_caption|gate)"
         r"|mlp\.(w1|w2|w3)"
         r"|attention_adaln\.(shift_down|scale_down|gate_down|shift_up|scale_up|gate_up)"
         r"|mlp_adaln\.(shift_down|scale_down|gate_down|shift_up|scale_up|gate_up)))$"
@@ -65,16 +70,18 @@ LORA_TARGET_PRESETS: dict[str, str] = {
     "conditioning": (
         r"^(cond_module\.(0|2|4)"
         r"|speaker_encoder\.in_proj"
-        r"|blocks\.\d+\.attention\.(wk_text|wv_text|wk_speaker|wv_speaker))$"
+        r"|blocks\.\d+\.attention\.(wk_text|wv_text|wk_speaker|wv_speaker|wk_caption|wv_caption))$"
     ),
     "all_attn_mlp": (
         r"^(text_encoder\.blocks\.\d+\."
+        r"(attention\.(wq|wk|wv|wo|gate)|mlp\.(w1|w2|w3))"
+        r"|caption_encoder\.blocks\.\d+\."
         r"(attention\.(wq|wk|wv|wo|gate)|mlp\.(w1|w2|w3))"
         r"|speaker_encoder\.in_proj"
         r"|speaker_encoder\.blocks\.\d+\."
         r"(attention\.(wq|wk|wv|wo|gate)|mlp\.(w1|w2|w3))"
         r"|blocks\.\d+\."
-        r"(attention\.(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|gate)"
+        r"(attention\.(wq|wk|wv|wo|wk_text|wv_text|wk_speaker|wv_speaker|wk_caption|wv_caption|gate)"
         r"|mlp\.(w1|w2|w3)))$"
     ),
     "all_linear": (
@@ -84,10 +91,12 @@ LORA_TARGET_PRESETS: dict[str, str] = {
         r"|out_proj"
         r"|text_encoder\.blocks\.\d+\."
         r"(attention\.(wq|wk|wv|wo|gate)|mlp\.(w1|w2|w3))"
+        r"|caption_encoder\.blocks\.\d+\."
+        r"(attention\.(wq|wk|wv|wo|gate)|mlp\.(w1|w2|w3))"
         r"|speaker_encoder\.blocks\.\d+\."
         r"(attention\.(wq|wk|wv|wo|gate)|mlp\.(w1|w2|w3))"
         r"|blocks\.\d+\."
-        r"(attention\.(wq|wk|wv|wk_text|wv_text|wk_speaker|wv_speaker|gate|wo)"
+        r"(attention\.(wq|wk|wv|wk_text|wv_text|wk_speaker|wv_speaker|wk_caption|wv_caption|gate|wo)"
         r"|mlp\.(w1|w2|w3)"
         r"|attention_adaln\.(shift_down|scale_down|gate_down|shift_up|scale_up|gate_up)"
         r"|mlp_adaln\.(shift_down|scale_down|gate_down|shift_up|scale_up|gate_up)))$"

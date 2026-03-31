@@ -166,6 +166,7 @@ class RuntimeKey:
 @dataclass
 class SamplingRequest:
     text: str
+    caption: str | None = None
     ref_wav: str | None = None
     ref_latent: str | None = None
     no_ref: bool = False
@@ -176,8 +177,10 @@ class SamplingRequest:
     seconds: float = 30.0
     max_ref_seconds: float | None = 30.0
     max_text_len: int | None = None
+    max_caption_len: int | None = None
     num_steps: int = 40
     cfg_scale_text: float = 3.0
+    cfg_scale_caption: float = 3.0
     cfg_scale_speaker: float = 5.0
     cfg_guidance_mode: str = "independent"
     cfg_scale: float | None = None
@@ -243,31 +246,40 @@ def resolve_cfg_scales(
     *,
     cfg_guidance_mode: str,
     cfg_scale_text: float,
+    cfg_scale_caption: float,
     cfg_scale_speaker: float,
     cfg_scale: float | None,
-) -> tuple[float, float, list[str]]:
+    use_caption_condition: bool = True,
+    use_speaker_condition: bool = True,
+) -> tuple[float, float, float, list[str]]:
     """Normalize/validate CFG scales for guidance mode."""
     messages: list[str] = []
     text_val = float(cfg_scale_text)
+    caption_val = float(cfg_scale_caption)
     speaker_val = float(cfg_scale_speaker)
 
     if cfg_scale is not None:
         text_val = float(cfg_scale)
+        caption_val = float(cfg_scale)
         speaker_val = float(cfg_scale)
+    if not use_speaker_condition:
+        if speaker_val > 0.0:
+            messages.append(
+                "info: speaker conditioning is disabled for this checkpoint; ignoring cfg_scale_speaker."
+            )
+        speaker_val = 0.0
 
     mode = str(cfg_guidance_mode).strip().lower()
-    if (
-        mode == "joint"
-        and text_val > 0.0
-        and speaker_val > 0.0
-        and abs(text_val - speaker_val) > 1e-6
-    ):
+    enabled_vals = [value for value in (text_val, speaker_val) if value > 0.0]
+    if use_caption_condition and caption_val > 0.0:
+        enabled_vals.append(caption_val)
+    if mode == "joint" and enabled_vals and (max(enabled_vals) - min(enabled_vals) > 1e-6):
         raise ValueError(
-            "cfg_guidance_mode='joint' requires equal cfg_scale_text/cfg_scale_speaker, "
+            "cfg_guidance_mode='joint' requires equal enabled cfg_scale_text/cfg_scale_caption/cfg_scale_speaker, "
             "or set cfg_scale."
         )
 
-    return text_val, speaker_val, messages
+    return text_val, caption_val, speaker_val, messages
 
 
 def _load_torch_checkpoint_payload(path: Path) -> dict:
@@ -278,7 +290,7 @@ def _load_torch_checkpoint_payload(path: Path) -> dict:
 
 
 _CONFIG_META_KEY = "config_json"
-_INFERENCE_CONFIG_KEYS = {"max_text_len", "fixed_target_latent_steps"}
+_INFERENCE_CONFIG_KEYS = {"max_text_len", "max_caption_len", "fixed_target_latent_steps"}
 
 
 def _load_checkpoint_from_pt(path: Path) -> tuple[dict[str, torch.Tensor], dict, dict | None]:
@@ -387,8 +399,10 @@ class InferenceRuntime:
         train_cfg: dict | None,
         model: TextToLatentRFDiT,
         tokenizer: PretrainedTextTokenizer,
+        caption_tokenizer: PretrainedTextTokenizer | None,
         codec: DACVAECodec,
         default_text_max_len: int,
+        default_caption_max_len: int,
     ) -> None:
         self.key = key
         self.model_device = resolve_runtime_device(key.model_device)
@@ -397,8 +411,10 @@ class InferenceRuntime:
         self.train_cfg = train_cfg
         self.model = model
         self.tokenizer = tokenizer
+        self.caption_tokenizer = caption_tokenizer
         self.codec = codec
         self.default_text_max_len = default_text_max_len
+        self.default_caption_max_len = default_caption_max_len
         self._infer_lock = threading.Lock()
 
     @classmethod
@@ -439,12 +455,30 @@ class InferenceRuntime:
                 f"text_vocab_size mismatch: checkpoint text_vocab_size={model_cfg.text_vocab_size} but tokenizer "
                 f"({model_cfg.text_tokenizer_repo}) vocab_size={tokenizer.vocab_size}."
             )
+        caption_tokenizer = None
+        if model_cfg.use_caption_condition:
+            caption_tokenizer = PretrainedTextTokenizer.from_pretrained(
+                repo_id=model_cfg.caption_tokenizer_repo_resolved,
+                add_bos=model_cfg.caption_add_bos_resolved,
+                local_files_only=False,
+            )
+            if caption_tokenizer.vocab_size != model_cfg.caption_vocab_size_resolved:
+                raise ValueError(
+                    f"caption_vocab_size mismatch: checkpoint caption_vocab_size={model_cfg.caption_vocab_size_resolved} but tokenizer ({model_cfg.caption_tokenizer_repo_resolved}) "
+                    f"vocab_size={caption_tokenizer.vocab_size}."
+                )
 
         default_text_max_len = 256
+        default_caption_max_len = default_text_max_len
         if isinstance(train_cfg, dict):
             ckpt_text_max_len = train_cfg.get("max_text_len")
             if isinstance(ckpt_text_max_len, int) and ckpt_text_max_len > 0:
                 default_text_max_len = int(ckpt_text_max_len)
+            ckpt_caption_max_len = train_cfg.get("max_caption_len")
+            if isinstance(ckpt_caption_max_len, int) and ckpt_caption_max_len > 0:
+                default_caption_max_len = int(ckpt_caption_max_len)
+            else:
+                default_caption_max_len = default_text_max_len
 
         codec = DACVAECodec.load(
             repo_id=key.codec_repo,
@@ -466,8 +500,10 @@ class InferenceRuntime:
             train_cfg=train_cfg if isinstance(train_cfg, dict) else None,
             model=model,
             tokenizer=tokenizer,
+            caption_tokenizer=caption_tokenizer,
             codec=codec,
             default_text_max_len=default_text_max_len,
+            default_caption_max_len=default_caption_max_len,
         )
 
     def _load_reference_latent(
@@ -476,8 +512,14 @@ class InferenceRuntime:
         req: SamplingRequest,
         batch_size: int,
         messages: list[str],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         runtime_dtype = next(self.model.parameters()).dtype
+        if not self.model_cfg.use_speaker_condition:
+            if req.ref_wav is not None or req.ref_latent is not None:
+                messages.append(
+                    "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
+                )
+            return None, None
         if req.no_ref:
             ref_len = max(1, int(self.model_cfg.speaker_patch_size))
             ref_latent_patched = torch.zeros(
@@ -610,6 +652,18 @@ class InferenceRuntime:
         )
         if text_max_len <= 0:
             raise ValueError(f"max_text_len must be > 0, got {text_max_len}")
+        caption_max_len = (
+            self.default_caption_max_len
+            if req.max_caption_len is None
+            else int(req.max_caption_len)
+        )
+        if self.model_cfg.use_caption_condition and caption_max_len <= 0:
+            raise ValueError(f"max_caption_len must be > 0, got {caption_max_len}")
+        has_caption_text = bool(
+            self.model_cfg.use_caption_condition
+            and req.caption is not None
+            and str(req.caption).strip() != ""
+        )
 
         truncation_factor = None if req.truncation_factor is None else float(req.truncation_factor)
         rescale_k = None if req.rescale_k is None else float(req.rescale_k)
@@ -629,15 +683,23 @@ class InferenceRuntime:
             None if req.speaker_kv_max_layers is None else int(req.speaker_kv_max_layers)
         )
         if speaker_kv_scale is not None:
-            if speaker_kv_scale <= 0:
-                raise ValueError(f"speaker_kv_scale must be > 0, got {speaker_kv_scale}")
-            speaker_kv_min_t = 0.9 if req.speaker_kv_min_t is None else float(req.speaker_kv_min_t)
-            if not (0.0 <= speaker_kv_min_t <= 1.0):
-                raise ValueError(f"speaker_kv_min_t must be in [0, 1], got {speaker_kv_min_t}")
-            if speaker_kv_max_layers is not None and speaker_kv_max_layers < 0:
-                raise ValueError(
-                    f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}"
+            if not self.model_cfg.use_speaker_condition:
+                messages.append(
+                    "info: speaker conditioning is disabled for this checkpoint; ignoring speaker_kv_scale."
                 )
+                speaker_kv_scale = None
+            else:
+                if speaker_kv_scale <= 0:
+                    raise ValueError(f"speaker_kv_scale must be > 0, got {speaker_kv_scale}")
+                speaker_kv_min_t = (
+                    0.9 if req.speaker_kv_min_t is None else float(req.speaker_kv_min_t)
+                )
+                if not (0.0 <= speaker_kv_min_t <= 1.0):
+                    raise ValueError(f"speaker_kv_min_t must be in [0, 1], got {speaker_kv_min_t}")
+                if speaker_kv_max_layers is not None and speaker_kv_max_layers < 0:
+                    raise ValueError(
+                        f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}"
+                    )
 
         cfg_mode = str(req.cfg_guidance_mode).strip().lower()
         if cfg_mode not in {"independent", "joint", "alternating"}:
@@ -646,11 +708,14 @@ class InferenceRuntime:
                 "Expected one of: independent, joint, alternating."
             )
 
-        cfg_scale_text, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
+        cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
             cfg_guidance_mode=cfg_mode,
             cfg_scale_text=req.cfg_scale_text,
+            cfg_scale_caption=req.cfg_scale_caption,
             cfg_scale_speaker=req.cfg_scale_speaker,
             cfg_scale=req.cfg_scale,
+            use_caption_condition=has_caption_text,
+            use_speaker_condition=self.model_cfg.use_speaker_condition,
         )
         messages.extend(scale_messages)
         for msg in scale_messages:
@@ -678,6 +743,22 @@ class InferenceRuntime:
             _log(f"[runtime] tokenize_text: {stage_sec * 1000.0:.1f} ms")
             text_ids = text_ids.to(self.model_device)
             text_mask = text_mask.to(self.model_device)
+            caption_ids = None
+            caption_mask = None
+            if self.model_cfg.use_caption_condition:
+                if self.caption_tokenizer is None:
+                    raise RuntimeError(
+                        "Caption conditioning is enabled but caption tokenizer is not loaded."
+                    )
+                caption_text = "" if req.caption is None else str(req.caption).strip()
+                caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
+                    [caption_text] * num_candidates,
+                    max_length=caption_max_len,
+                )
+                if caption_text == "":
+                    caption_mask.zero_()
+                caption_ids = caption_ids.to(self.model_device)
+                caption_mask = caption_mask.to(self.model_device)
 
             target_samples = int(float(req.seconds) * self.codec.sample_rate)
             latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
@@ -714,8 +795,11 @@ class InferenceRuntime:
                 ref_latent=ref_latent,
                 ref_mask=ref_mask,
                 sequence_length=patched_steps,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
                 num_steps=int(req.num_steps),
                 cfg_scale_text=cfg_scale_text,
+                cfg_scale_caption=cfg_scale_caption,
                 cfg_scale_speaker=cfg_scale_speaker,
                 cfg_guidance_mode=cfg_mode,
                 cfg_min_t=float(req.cfg_min_t),

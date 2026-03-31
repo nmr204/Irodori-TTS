@@ -53,6 +53,7 @@ CHECKPOINT_BEST_VAL_LOSS_RE = re.compile(
     r"^checkpoint_best_val_loss_(\d+)_(-?\d+(?:\.\d+)?)(?:\.pt)?$"
 )
 SAFETENSORS_CONFIG_META_KEY = "config_json"
+SAFETENSORS_INFERENCE_CONFIG_KEYS = {"max_text_len", "max_caption_len", "fixed_target_latent_steps"}
 
 
 def set_seed(seed: int) -> None:
@@ -264,27 +265,56 @@ def _final_checkpoint_path(output_dir: Path, train_cfg: TrainConfig) -> Path:
     return output_dir / "checkpoint_final.pt"
 
 
+def build_condition_tokenizer(
+    *,
+    repo_id: str,
+    add_bos: bool,
+    vocab_size: int,
+    local_files_only: bool = False,
+) -> PretrainedTextTokenizer:
+    tokenizer = PretrainedTextTokenizer.from_pretrained(
+        repo_id=repo_id,
+        add_bos=bool(add_bos),
+        local_files_only=local_files_only,
+    )
+    if tokenizer.vocab_size != vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab_size mismatch: expected {vocab_size} but tokenizer "
+            f"({repo_id}) vocab_size={tokenizer.vocab_size}."
+        )
+    return tokenizer
+
+
 def build_text_tokenizer(
     model_cfg: ModelConfig,
     *,
     local_files_only: bool = False,
 ) -> PretrainedTextTokenizer:
-    tokenizer = PretrainedTextTokenizer.from_pretrained(
+    return build_condition_tokenizer(
         repo_id=model_cfg.text_tokenizer_repo,
         add_bos=bool(model_cfg.text_add_bos),
+        vocab_size=int(model_cfg.text_vocab_size),
         local_files_only=local_files_only,
     )
-    if tokenizer.vocab_size != model_cfg.text_vocab_size:
-        raise ValueError(
-            f"text_vocab_size mismatch: model text_vocab_size={model_cfg.text_vocab_size} but tokenizer "
-            f"({model_cfg.text_tokenizer_repo}) vocab_size={tokenizer.vocab_size}."
-        )
-    return tokenizer
 
 
-def validate_text_backbone_dim(
+def build_caption_tokenizer(
     model_cfg: ModelConfig,
     *,
+    local_files_only: bool = False,
+) -> PretrainedTextTokenizer:
+    return build_condition_tokenizer(
+        repo_id=model_cfg.caption_tokenizer_repo_resolved,
+        add_bos=model_cfg.caption_add_bos_resolved,
+        vocab_size=model_cfg.caption_vocab_size_resolved,
+        local_files_only=local_files_only,
+    )
+
+
+def validate_pretrained_backbone_dim(
+    *,
+    repo_id: str,
+    expected_dim: int,
     local_files_only: bool = False,
 ) -> int:
     try:
@@ -296,28 +326,50 @@ def validate_text_backbone_dim(
         ) from exc
 
     text_cfg = AutoConfig.from_pretrained(
-        model_cfg.text_tokenizer_repo,
+        repo_id,
         trust_remote_code=False,
         local_files_only=local_files_only,
     )
     hidden_size = getattr(text_cfg, "hidden_size", None)
     if hidden_size is None:
-        raise ValueError(
-            f"Could not read hidden_size from pretrained config: {model_cfg.text_tokenizer_repo}"
-        )
+        raise ValueError(f"Could not read hidden_size from pretrained config: {repo_id}")
     hidden_size = int(hidden_size)
-    if hidden_size != model_cfg.text_dim:
+    if hidden_size != expected_dim:
         raise ValueError(
-            f"text_dim mismatch: model text_dim={model_cfg.text_dim} but pretrained hidden_size={hidden_size} "
-            f"for repo {model_cfg.text_tokenizer_repo}."
+            f"Condition encoder dim mismatch: expected {expected_dim} but pretrained hidden_size={hidden_size} "
+            f"for repo {repo_id}."
         )
     return hidden_size
 
 
-def initialize_text_embedding_from_pretrained(
-    model: TextToLatentRFDiT,
+def validate_text_backbone_dim(
     model_cfg: ModelConfig,
     *,
+    local_files_only: bool = False,
+) -> int:
+    return validate_pretrained_backbone_dim(
+        repo_id=model_cfg.text_tokenizer_repo,
+        expected_dim=int(model_cfg.text_dim),
+        local_files_only=local_files_only,
+    )
+
+
+def validate_caption_backbone_dim(
+    model_cfg: ModelConfig,
+    *,
+    local_files_only: bool = False,
+) -> int:
+    return validate_pretrained_backbone_dim(
+        repo_id=model_cfg.caption_tokenizer_repo_resolved,
+        expected_dim=model_cfg.caption_dim_resolved,
+        local_files_only=local_files_only,
+    )
+
+
+def initialize_embedding_from_pretrained(
+    embedding: torch.nn.Embedding,
+    *,
+    repo_id: str,
     local_files_only: bool = False,
 ) -> None:
     try:
@@ -329,7 +381,7 @@ def initialize_text_embedding_from_pretrained(
         ) from exc
 
     text_backbone = AutoModel.from_pretrained(
-        model_cfg.text_tokenizer_repo,
+        repo_id,
         trust_remote_code=False,
         dtype=torch.float32,
         low_cpu_mem_usage=True,
@@ -337,16 +389,14 @@ def initialize_text_embedding_from_pretrained(
     )
     pretrained_embedding = text_backbone.get_input_embeddings()
     if pretrained_embedding is None:
-        raise ValueError(
-            f"Pretrained model has no input embeddings: {model_cfg.text_tokenizer_repo}"
-        )
+        raise ValueError(f"Pretrained model has no input embeddings: {repo_id}")
     src_weight = pretrained_embedding.weight.detach().to(device="cpu", dtype=torch.float32)
-    tgt_weight = model.text_encoder.text_embedding.weight
+    tgt_weight = embedding.weight
     src_vocab, src_dim = tuple(src_weight.shape)
     tgt_vocab, tgt_dim = tuple(tgt_weight.shape)
     if src_dim != tgt_dim:
         raise ValueError(
-            f"Embedding hidden size mismatch: pretrained={src_dim} model={tgt_dim}. Check text_dim."
+            f"Embedding hidden size mismatch: pretrained={src_dim} model={tgt_dim} for repo={repo_id}."
         )
 
     copy_rows = min(src_vocab, tgt_vocab)
@@ -356,6 +406,36 @@ def initialize_text_embedding_from_pretrained(
         )
 
     del text_backbone
+
+
+def initialize_text_embedding_from_pretrained(
+    model: TextToLatentRFDiT,
+    model_cfg: ModelConfig,
+    *,
+    local_files_only: bool = False,
+) -> None:
+    initialize_embedding_from_pretrained(
+        model.text_encoder.text_embedding,
+        repo_id=model_cfg.text_tokenizer_repo,
+        local_files_only=local_files_only,
+    )
+
+
+def initialize_caption_embedding_from_pretrained(
+    model: TextToLatentRFDiT,
+    model_cfg: ModelConfig,
+    *,
+    local_files_only: bool = False,
+) -> None:
+    if model.caption_encoder is None:
+        raise RuntimeError(
+            "Caption embedding initialization requested but caption encoder is absent."
+        )
+    initialize_embedding_from_pretrained(
+        model.caption_encoder.text_embedding,
+        repo_id=model_cfg.caption_tokenizer_repo_resolved,
+        local_files_only=local_files_only,
+    )
 
 
 def _load_model_state_from_checkpoint(
@@ -372,7 +452,11 @@ def _load_model_state_from_checkpoint(
         if config_json:
             parsed = json.loads(config_json)
             if isinstance(parsed, dict):
-                checkpoint_model_cfg = parsed
+                checkpoint_model_cfg = {
+                    key: value
+                    for key, value in parsed.items()
+                    if key not in SAFETENSORS_INFERENCE_CONFIG_KEYS
+                }
         return load_safetensors_file(str(path), device="cpu"), checkpoint_model_cfg, None
 
     payload = torch.load(path, map_location="cpu", weights_only=True)
@@ -398,20 +482,227 @@ def _check_model_config_compatibility(
     checkpoint_path: Path,
     checkpoint_model_cfg: dict | None,
     current_model_cfg: ModelConfig,
+    *,
+    require_caption_match: bool,
 ) -> None:
     if checkpoint_model_cfg is None:
         return
 
-    for key in ("latent_dim", "latent_patch_size", "text_vocab_size", "text_dim", "model_dim"):
-        checkpoint_value = checkpoint_model_cfg.get(key)
-        if checkpoint_value is None:
-            continue
-        current_value = getattr(current_model_cfg, key)
-        if int(checkpoint_value) != int(current_value):
+    checkpoint_cfg = merge_dataclass_overrides(
+        ModelConfig(),
+        checkpoint_model_cfg,
+        section="checkpoint model_config",
+    )
+
+    comparisons: list[tuple[str, object, object]] = [
+        ("latent_dim", checkpoint_cfg.latent_dim, current_model_cfg.latent_dim),
+        (
+            "latent_patch_size",
+            checkpoint_cfg.latent_patch_size,
+            current_model_cfg.latent_patch_size,
+        ),
+        ("model_dim", checkpoint_cfg.model_dim, current_model_cfg.model_dim),
+        ("num_layers", checkpoint_cfg.num_layers, current_model_cfg.num_layers),
+        ("num_heads", checkpoint_cfg.num_heads, current_model_cfg.num_heads),
+        ("mlp_ratio", checkpoint_cfg.mlp_ratio, current_model_cfg.mlp_ratio),
+        ("text_vocab_size", checkpoint_cfg.text_vocab_size, current_model_cfg.text_vocab_size),
+        ("text_dim", checkpoint_cfg.text_dim, current_model_cfg.text_dim),
+        ("text_layers", checkpoint_cfg.text_layers, current_model_cfg.text_layers),
+        ("text_heads", checkpoint_cfg.text_heads, current_model_cfg.text_heads),
+        (
+            "text_mlp_ratio",
+            checkpoint_cfg.text_mlp_ratio_resolved,
+            current_model_cfg.text_mlp_ratio_resolved,
+        ),
+        ("adaln_rank", checkpoint_cfg.adaln_rank, current_model_cfg.adaln_rank),
+    ]
+    if checkpoint_cfg.use_speaker_condition and current_model_cfg.use_speaker_condition:
+        comparisons.extend(
+            [
+                ("speaker_dim", checkpoint_cfg.speaker_dim, current_model_cfg.speaker_dim),
+                ("speaker_layers", checkpoint_cfg.speaker_layers, current_model_cfg.speaker_layers),
+                ("speaker_heads", checkpoint_cfg.speaker_heads, current_model_cfg.speaker_heads),
+                (
+                    "speaker_mlp_ratio",
+                    checkpoint_cfg.speaker_mlp_ratio_resolved,
+                    current_model_cfg.speaker_mlp_ratio_resolved,
+                ),
+                (
+                    "speaker_patch_size",
+                    checkpoint_cfg.speaker_patch_size,
+                    current_model_cfg.speaker_patch_size,
+                ),
+            ]
+        )
+    if require_caption_match:
+        comparisons.extend(
+            [
+                (
+                    "use_caption_condition",
+                    checkpoint_cfg.use_caption_condition,
+                    current_model_cfg.use_caption_condition,
+                ),
+                (
+                    "use_speaker_condition",
+                    checkpoint_cfg.use_speaker_condition,
+                    current_model_cfg.use_speaker_condition,
+                ),
+                (
+                    "caption_vocab_size",
+                    checkpoint_cfg.caption_vocab_size_resolved,
+                    current_model_cfg.caption_vocab_size_resolved,
+                ),
+                (
+                    "caption_tokenizer_repo",
+                    checkpoint_cfg.caption_tokenizer_repo_resolved,
+                    current_model_cfg.caption_tokenizer_repo_resolved,
+                ),
+                (
+                    "caption_add_bos",
+                    checkpoint_cfg.caption_add_bos_resolved,
+                    current_model_cfg.caption_add_bos_resolved,
+                ),
+                (
+                    "caption_dim",
+                    checkpoint_cfg.caption_dim_resolved,
+                    current_model_cfg.caption_dim_resolved,
+                ),
+                (
+                    "caption_layers",
+                    checkpoint_cfg.caption_layers_resolved,
+                    current_model_cfg.caption_layers_resolved,
+                ),
+                (
+                    "caption_heads",
+                    checkpoint_cfg.caption_heads_resolved,
+                    current_model_cfg.caption_heads_resolved,
+                ),
+                (
+                    "caption_mlp_ratio",
+                    checkpoint_cfg.caption_mlp_ratio_resolved,
+                    current_model_cfg.caption_mlp_ratio_resolved,
+                ),
+            ]
+        )
+
+    for key, checkpoint_value, current_value in comparisons:
+        if checkpoint_value != current_value:
             raise ValueError(
                 f"Checkpoint/config mismatch for '{key}': checkpoint={checkpoint_value} "
                 f"current={current_value} ({checkpoint_path})"
             )
+
+
+def checkpoint_uses_caption_condition(
+    checkpoint_model_cfg: dict | None,
+    state_dict: dict[str, torch.Tensor],
+) -> bool:
+    if checkpoint_model_cfg is not None:
+        checkpoint_cfg = merge_dataclass_overrides(
+            ModelConfig(),
+            checkpoint_model_cfg,
+            section="checkpoint model_config",
+        )
+        if checkpoint_cfg.use_caption_condition:
+            return True
+    return any(
+        key.startswith("caption_encoder.")
+        or key.startswith("caption_norm.")
+        or ".wk_caption." in key
+        or ".wv_caption." in key
+        for key in state_dict
+    )
+
+
+def load_model_state_partially(
+    model: TextToLatentRFDiT,
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[list[str], list[str], list[str]]:
+    model_state = model.state_dict()
+    filtered_state: dict[str, torch.Tensor] = {}
+    skipped_shape: list[str] = []
+    skipped_extra: list[str] = []
+
+    for key, value in state_dict.items():
+        target = model_state.get(key)
+        if target is None:
+            skipped_extra.append(key)
+            continue
+        if tuple(target.shape) != tuple(value.shape):
+            skipped_shape.append(key)
+            continue
+        filtered_state[key] = value
+
+    missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
+    if unexpected_keys:
+        skipped_extra.extend(unexpected_keys)
+    return missing_keys, skipped_shape, skipped_extra
+
+
+def _canonical_parameter_key(key: str) -> str:
+    prefix = "base_model.model."
+    if key.startswith(prefix):
+        return key[len(prefix) :]
+    return key
+
+
+def is_caption_only_parameter(key: str) -> bool:
+    key = _canonical_parameter_key(key)
+    return (
+        key.startswith("caption_encoder.")
+        or key.startswith("caption_norm.")
+        or ".wk_caption." in key
+        or ".wv_caption." in key
+    )
+
+
+def is_speaker_only_parameter(key: str) -> bool:
+    key = _canonical_parameter_key(key)
+    return (
+        key.startswith("speaker_encoder.")
+        or key.startswith("speaker_norm.")
+        or ".wk_speaker." in key
+        or ".wv_speaker." in key
+    )
+
+
+def clear_non_caption_grads(model: TextToLatentRFDiT) -> tuple[int, int]:
+    caption_grad_params = 0
+    cleared_grad_params = 0
+    for key, param in model.named_parameters():
+        if is_caption_only_parameter(key):
+            if param.grad is not None:
+                caption_grad_params += 1
+            continue
+        if param.grad is not None:
+            cleared_grad_params += 1
+        param.grad = None
+    return caption_grad_params, cleared_grad_params
+
+
+def validate_caption_upgrade_partial_load(
+    checkpoint_path: Path,
+    missing_keys: list[str],
+    skipped_shape: list[str],
+    skipped_extra: list[str],
+) -> None:
+    if skipped_shape:
+        raise ValueError(
+            "Checkpoint/config shape mismatch while upgrading caption conditioning: "
+            f"{checkpoint_path} skipped_shape={skipped_shape[:8]}"
+        )
+    non_speaker_extra = [key for key in skipped_extra if not is_speaker_only_parameter(key)]
+    if non_speaker_extra:
+        raise ValueError(
+            "Unexpected checkpoint keys while upgrading caption conditioning: "
+            f"{checkpoint_path} skipped_extra={non_speaker_extra[:8]}"
+        )
+    non_caption_missing = [key for key in missing_keys if not is_caption_only_parameter(key)]
+    if non_caption_missing:
+        raise ValueError(
+            "Partial init from caption-free checkpoint left non-caption parameters missing: "
+            f"{checkpoint_path} missing={non_caption_missing[:8]}"
+        )
 
 
 def _load_checkpoint_payload(path: str | Path, *, map_location) -> dict:
@@ -490,6 +781,16 @@ def _initialize_base_model_from_pretrained_embeddings(
                 model_cfg,
                 local_files_only=False,
             )
+            if model_cfg.use_caption_condition:
+                print(
+                    "Initializing caption embedding from pretrained model: "
+                    f"{model_cfg.caption_tokenizer_repo_resolved}"
+                )
+                initialize_caption_embedding_from_pretrained(
+                    raw_model,
+                    model_cfg,
+                    local_files_only=False,
+                )
         dist.barrier()
         if not is_main_process:
             initialize_text_embedding_from_pretrained(
@@ -497,6 +798,12 @@ def _initialize_base_model_from_pretrained_embeddings(
                 model_cfg,
                 local_files_only=True,
             )
+            if model_cfg.use_caption_condition:
+                initialize_caption_embedding_from_pretrained(
+                    raw_model,
+                    model_cfg,
+                    local_files_only=True,
+                )
         dist.barrier()
         return
 
@@ -507,6 +814,17 @@ def _initialize_base_model_from_pretrained_embeddings(
         model_cfg,
         local_files_only=False,
     )
+    if model_cfg.use_caption_condition:
+        if is_main_process:
+            print(
+                "Initializing caption embedding from pretrained model: "
+                f"{model_cfg.caption_tokenizer_repo_resolved}"
+            )
+        initialize_caption_embedding_from_pretrained(
+            raw_model,
+            model_cfg,
+            local_files_only=False,
+        )
 
 
 def _apply_base_initialization(
@@ -533,10 +851,75 @@ def _apply_base_initialization(
             raise ValueError("LoRA checkpoint metadata is missing base_init.checkpoint_path.")
         init_path = _normalize_checkpoint_path(checkpoint_path)
         init_state, init_model_cfg, _ = _load_model_state_from_checkpoint(init_path)
-        _check_model_config_compatibility(init_path, init_model_cfg, model_cfg)
-        raw_model.load_state_dict(init_state)
+        checkpoint_has_caption = checkpoint_uses_caption_condition(init_model_cfg, init_state)
+        current_has_caption = bool(model_cfg.use_caption_condition)
+        if checkpoint_has_caption and not current_has_caption:
+            raise ValueError(
+                "Caption-conditioned checkpoint cannot initialize a caption-free config. "
+                "Use a caption-enabled config for this checkpoint."
+            )
+
+        require_caption_match = checkpoint_has_caption and current_has_caption
+        _check_model_config_compatibility(
+            init_path,
+            init_model_cfg,
+            model_cfg,
+            require_caption_match=require_caption_match,
+        )
+
+        missing_keys: list[str] = []
+        initialized_caption_embedding = False
+        if current_has_caption and not checkpoint_has_caption:
+            missing_keys, skipped_shape, skipped_extra = load_model_state_partially(
+                raw_model,
+                init_state,
+            )
+            validate_caption_upgrade_partial_load(
+                init_path,
+                missing_keys,
+                skipped_shape,
+                skipped_extra,
+            )
+            if distributed:
+                if is_main_process:
+                    print(
+                        "Initializing caption embedding from pretrained model after caption-free checkpoint load: "
+                        f"{model_cfg.caption_tokenizer_repo_resolved}"
+                    )
+                    initialize_caption_embedding_from_pretrained(
+                        raw_model,
+                        model_cfg,
+                        local_files_only=False,
+                    )
+                dist.barrier()
+                if not is_main_process:
+                    initialize_caption_embedding_from_pretrained(
+                        raw_model,
+                        model_cfg,
+                        local_files_only=True,
+                    )
+                dist.barrier()
+            else:
+                if is_main_process:
+                    print(
+                        "Initializing caption embedding from pretrained model after caption-free checkpoint load: "
+                        f"{model_cfg.caption_tokenizer_repo_resolved}"
+                    )
+                initialize_caption_embedding_from_pretrained(
+                    raw_model,
+                    model_cfg,
+                    local_files_only=False,
+                )
+            initialized_caption_embedding = True
+        else:
+            raw_model.load_state_dict(init_state, strict=True)
+
         if is_main_process:
             print(f"Initialized model weights from: {init_path}")
+            if missing_keys:
+                print(f"Partial load missing keys: {len(missing_keys)}")
+            if initialized_caption_embedding:
+                print("Caption embedding was initialized from its pretrained tokenizer backbone.")
         return
 
     raise ValueError(f"Unsupported base_init mode: {mode!r}")
@@ -618,6 +1001,7 @@ def run_validation(
     distributed: bool,
 ) -> dict[str, float]:
     was_training = model.training
+    model_cfg = model.module.cfg if isinstance(model, DDP) else model.cfg
     model.eval()
     totals = torch.zeros(3, device=device, dtype=torch.float64)
 
@@ -625,12 +1009,22 @@ def run_validation(
         for batch in loader:
             text_ids = batch["text_ids"].to(device, non_blocking=True)
             text_mask = batch["text_mask"].to(device, non_blocking=True)
+            caption_ids = None
+            caption_mask = None
+            if model_cfg.use_caption_condition:
+                caption_ids = batch["caption_ids"].to(device, non_blocking=True)
+                caption_mask = batch["caption_mask"].to(device, non_blocking=True)
             x0 = batch["latent_patched"].to(device, non_blocking=True)
             x_mask = batch["latent_mask_patched"].to(device, non_blocking=True)
             x_mask_valid = batch["latent_mask_valid_patched"].to(device, non_blocking=True)
-            ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
-            ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
-            has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+            ref_latent = None
+            ref_mask = None
+            if model_cfg.use_speaker_condition:
+                ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
+                ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
+                has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+            else:
+                has_speaker = None
 
             bsz = x0.shape[0]
             if train_cfg.timestep_stratified:
@@ -655,9 +1049,10 @@ def run_validation(
             x_t = rf_interpolate(x0, noise, t)
             v_target = rf_velocity_target(x0, noise)
 
-            use_speaker = has_speaker
-            ref_mask = ref_mask & use_speaker[:, None]
-            ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
+            if model_cfg.use_speaker_condition:
+                use_speaker = has_speaker
+                ref_mask = ref_mask & use_speaker[:, None]
+                ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
 
             with (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -671,6 +1066,8 @@ def run_validation(
                     text_mask=text_mask,
                     ref_latent=ref_latent,
                     ref_mask=ref_mask,
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
                     latent_mask=x_mask,
                 )
 
@@ -764,6 +1161,12 @@ def main() -> None:
         default=256,
         help="Maximum token length for text conditioning (right-truncated).",
     )
+    parser.add_argument(
+        "--max-caption-len",
+        type=int,
+        default=None,
+        help="Maximum token length for caption conditioning (defaults to max_text_len).",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -774,6 +1177,21 @@ def main() -> None:
     parser.add_argument("--muon-momentum", type=float, default=0.95)
     parser.add_argument("--lr-scheduler", choices=["none", "cosine", "wsd"], default="none")
     parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument(
+        "--caption-warmup",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "During the first caption_warmup_steps optimizer steps, update only caption-only parameters "
+            "(caption encoder/norm and caption attention projections)."
+        ),
+    )
+    parser.add_argument(
+        "--caption-warmup-steps",
+        type=int,
+        default=0,
+        help="Number of optimizer steps to run caption-only warmup for when caption_warmup is enabled.",
+    )
     parser.add_argument("--stable-steps", type=int, default=0)
     parser.add_argument("--min-lr-scale", type=float, default=0.1)
     parser.add_argument("--latent-dim", type=int, default=128)
@@ -798,6 +1216,12 @@ def main() -> None:
         type=float,
         default=0.1,
         help="Probability of dropping text conditioning during training.",
+    )
+    parser.add_argument(
+        "--caption-condition-dropout",
+        type=float,
+        default=0.1,
+        help="Probability of dropping caption conditioning during training.",
     )
     parser.add_argument(
         "--speaker-condition-dropout",
@@ -979,6 +1403,8 @@ def main() -> None:
         )
     if cli_provided(raw_argv, "--max-text-len"):
         train_cfg = replace(train_cfg, max_text_len=args.max_text_len)
+    if cli_provided(raw_argv, "--max-caption-len"):
+        train_cfg = replace(train_cfg, max_caption_len=args.max_caption_len)
     if cli_provided(raw_argv, "--num-workers"):
         train_cfg = replace(train_cfg, num_workers=args.num_workers)
     if cli_provided(raw_argv, "--lr"):
@@ -999,6 +1425,10 @@ def main() -> None:
         train_cfg = replace(train_cfg, lr_scheduler=args.lr_scheduler)
     if cli_provided(raw_argv, "--warmup-steps"):
         train_cfg = replace(train_cfg, warmup_steps=args.warmup_steps)
+    if args.caption_warmup is not None:
+        train_cfg = replace(train_cfg, caption_warmup=bool(args.caption_warmup))
+    if cli_provided(raw_argv, "--caption-warmup-steps"):
+        train_cfg = replace(train_cfg, caption_warmup_steps=args.caption_warmup_steps)
     if cli_provided(raw_argv, "--stable-steps"):
         train_cfg = replace(train_cfg, stable_steps=args.stable_steps)
     if cli_provided(raw_argv, "--min-lr-scale"):
@@ -1007,6 +1437,8 @@ def main() -> None:
         train_cfg = replace(train_cfg, max_steps=args.max_steps)
     if cli_provided(raw_argv, "--text-condition-dropout"):
         train_cfg = replace(train_cfg, text_condition_dropout=args.text_condition_dropout)
+    if cli_provided(raw_argv, "--caption-condition-dropout"):
+        train_cfg = replace(train_cfg, caption_condition_dropout=args.caption_condition_dropout)
     if cli_provided(raw_argv, "--speaker-condition-dropout"):
         train_cfg = replace(train_cfg, speaker_condition_dropout=args.speaker_condition_dropout)
     if cli_provided(raw_argv, "--timestep-stratified"):
@@ -1094,6 +1526,8 @@ def main() -> None:
         )
     if train_cfg.max_text_len <= 0:
         raise ValueError(f"max_text_len must be > 0, got {train_cfg.max_text_len}")
+    if train_cfg.max_caption_len is not None and train_cfg.max_caption_len <= 0:
+        raise ValueError(f"max_caption_len must be > 0, got {train_cfg.max_caption_len}")
     if train_cfg.gradient_accumulation_steps <= 0:
         raise ValueError(
             f"gradient_accumulation_steps must be > 0, got {train_cfg.gradient_accumulation_steps}"
@@ -1102,6 +1536,11 @@ def main() -> None:
         raise ValueError(
             "speaker_condition_dropout must be in [0, 1], "
             f"got {train_cfg.speaker_condition_dropout}"
+        )
+    if not (0.0 <= train_cfg.caption_condition_dropout <= 1.0):
+        raise ValueError(
+            "caption_condition_dropout must be in [0, 1], "
+            f"got {train_cfg.caption_condition_dropout}"
         )
     if train_cfg.fixed_target_latent_steps is not None and train_cfg.fixed_target_latent_steps <= 0:
         raise ValueError(
@@ -1112,6 +1551,8 @@ def main() -> None:
         raise ValueError(
             "fixed_target_full_mask=True requires fixed_target_latent_steps to be set."
         )
+    if train_cfg.caption_warmup_steps < 0:
+        raise ValueError(f"caption_warmup_steps must be >= 0, got {train_cfg.caption_warmup_steps}")
     if train_cfg.dataloader_prefetch_factor <= 0:
         raise ValueError(
             f"dataloader_prefetch_factor must be > 0, got {train_cfg.dataloader_prefetch_factor}"
@@ -1192,6 +1633,14 @@ def main() -> None:
         if is_main_process:
             tokenizer = build_text_tokenizer(model_cfg, local_files_only=False)
             text_hidden_size = validate_text_backbone_dim(model_cfg, local_files_only=False)
+            caption_tokenizer = None
+            caption_hidden_size = None
+            if model_cfg.use_caption_condition:
+                caption_tokenizer = build_caption_tokenizer(model_cfg, local_files_only=False)
+                caption_hidden_size = validate_caption_backbone_dim(
+                    model_cfg,
+                    local_files_only=False,
+                )
         dist.barrier()
         if not is_main_process:
             tokenizer = build_text_tokenizer(model_cfg, local_files_only=local_files_only)
@@ -1199,19 +1648,47 @@ def main() -> None:
                 model_cfg,
                 local_files_only=local_files_only,
             )
+            caption_tokenizer = None
+            caption_hidden_size = None
+            if model_cfg.use_caption_condition:
+                caption_tokenizer = build_caption_tokenizer(
+                    model_cfg,
+                    local_files_only=local_files_only,
+                )
+                caption_hidden_size = validate_caption_backbone_dim(
+                    model_cfg,
+                    local_files_only=local_files_only,
+                )
         dist.barrier()
     else:
         tokenizer = build_text_tokenizer(model_cfg, local_files_only=False)
         text_hidden_size = validate_text_backbone_dim(model_cfg, local_files_only=False)
+        caption_tokenizer = None
+        caption_hidden_size = None
+        if model_cfg.use_caption_condition:
+            caption_tokenizer = build_caption_tokenizer(model_cfg, local_files_only=False)
+            caption_hidden_size = validate_caption_backbone_dim(
+                model_cfg,
+                local_files_only=False,
+            )
     if is_main_process:
         print(
             f"Text tokenizer={model_cfg.text_tokenizer_repo} vocab={tokenizer.vocab_size} add_bos={model_cfg.text_add_bos} padding_side=right "
             f"(pretrained hidden_size={text_hidden_size})."
         )
+        if model_cfg.use_caption_condition and caption_tokenizer is not None:
+            print(
+                f"Caption tokenizer={model_cfg.caption_tokenizer_repo_resolved} vocab={caption_tokenizer.vocab_size} add_bos={model_cfg.caption_add_bos_resolved} padding_side=right "
+                f"(pretrained hidden_size={caption_hidden_size})."
+            )
     full_dataset = LatentTextDataset(
         manifest_path=train_cfg.manifest_path,
         latent_dim=model_cfg.latent_dim,
         max_latent_steps=train_cfg.max_latent_steps,
+        enable_caption_condition=model_cfg.use_caption_condition,
+        enable_speaker_condition=model_cfg.use_speaker_condition,
+        show_manifest_progress=bool(train_cfg.progress and is_main_process),
+        manifest_progress_desc="Index Manifest",
     )
     train_dataset = full_dataset
     valid_dataset = None
@@ -1226,12 +1703,18 @@ def main() -> None:
             latent_dim=model_cfg.latent_dim,
             max_latent_steps=train_cfg.max_latent_steps,
             subset_indices=train_indices,
+            enable_caption_condition=model_cfg.use_caption_condition,
+            enable_speaker_condition=model_cfg.use_speaker_condition,
+            manifest_index=full_dataset.manifest_index,
         )
         valid_dataset = LatentTextDataset(
             manifest_path=train_cfg.manifest_path,
             latent_dim=model_cfg.latent_dim,
             max_latent_steps=train_cfg.max_latent_steps,
             subset_indices=valid_indices,
+            enable_caption_condition=model_cfg.use_caption_condition,
+            enable_speaker_condition=model_cfg.use_speaker_condition,
+            manifest_index=full_dataset.manifest_index,
         )
         if is_main_process:
             print(
@@ -1245,16 +1728,38 @@ def main() -> None:
         )
     collator = TTSCollator(
         tokenizer=tokenizer,
+        caption_tokenizer=caption_tokenizer,
         latent_dim=model_cfg.latent_dim,
         latent_patch_size=model_cfg.latent_patch_size,
         fixed_target_latent_steps=train_cfg.fixed_target_latent_steps,
         fixed_target_full_mask=train_cfg.fixed_target_full_mask,
         max_text_len=train_cfg.max_text_len,
+        max_caption_len=(
+            train_cfg.max_text_len
+            if train_cfg.max_caption_len is None
+            else train_cfg.max_caption_len
+        ),
     )
     if train_cfg.fixed_target_latent_steps is not None and is_main_process:
         print(
             f"Fixed target latent length enabled: steps={train_cfg.fixed_target_latent_steps} full_mask={train_cfg.fixed_target_full_mask}"
         )
+    if not model_cfg.use_speaker_condition and is_main_process:
+        print("Speaker conditioning disabled for caption-conditioned voice-design model.")
+    if train_cfg.caption_warmup and is_main_process:
+        if not model_cfg.use_caption_condition:
+            print(
+                "warning: caption_warmup=True requested, but caption conditioning is disabled. Ignoring."
+            )
+        elif train_cfg.caption_warmup_steps <= 0:
+            print(
+                "warning: caption_warmup=True requested, but caption_warmup_steps <= 0. Ignoring."
+            )
+        else:
+            print(
+                "Caption warmup enabled: only caption-only parameters will update for the first "
+                f"{train_cfg.caption_warmup_steps} optimizer steps."
+            )
     if train_cfg.timestep_stratified and is_main_process:
         print("Using stratified logit-normal timestep sampling.")
     train_sampler = None
@@ -1410,7 +1915,6 @@ def main() -> None:
             f"target_modules={train_cfg.lora_target_modules!r} "
             f"trainable={trainable_params:,}/{total_params:,}"
         )
-
     train_model = raw_model
     if train_cfg.compile_model:
         if not hasattr(torch, "compile"):
@@ -1428,14 +1932,22 @@ def main() -> None:
         # masked in a step. Without this, DDP can hang after step 1 due to
         # unreduced gradients in ranks where a branch is entirely unused.
         if not ddp_find_unused_parameters and not ddp_find_unused_parameters_explicit:
-            speaker_labeled_count = sum(
-                1 for x in train_dataset.samples if x.get("speaker_id") is not None
-            )
+            speaker_labeled_count = train_dataset.speaker_labeled_count
             has_partial_or_no_speaker_labels = speaker_labeled_count < len(train_dataset)
-            has_stochastic_cond_drop = (
-                train_cfg.text_condition_dropout > 0.0 or train_cfg.speaker_condition_dropout > 0.0
+            caption_labeled_count = train_dataset.caption_labeled_count
+            has_partial_or_no_caption_labels = (
+                model_cfg.use_caption_condition and caption_labeled_count < len(train_dataset)
             )
-            if has_partial_or_no_speaker_labels or has_stochastic_cond_drop:
+            has_stochastic_cond_drop = (
+                train_cfg.text_condition_dropout > 0.0
+                or train_cfg.speaker_condition_dropout > 0.0
+                or (model_cfg.use_caption_condition and train_cfg.caption_condition_dropout > 0.0)
+            )
+            if (
+                has_partial_or_no_speaker_labels
+                or has_partial_or_no_caption_labels
+                or has_stochastic_cond_drop
+            ):
                 ddp_find_unused_parameters = True
                 if is_main_process:
                     print(
@@ -1490,6 +2002,17 @@ def main() -> None:
     )
     accum_steps = int(train_cfg.gradient_accumulation_steps)
     global_batch_size = train_cfg.batch_size * world_size * accum_steps
+    caption_warmup_active = bool(
+        train_cfg.caption_warmup
+        and model_cfg.use_caption_condition
+        and train_cfg.caption_warmup_steps > 0
+        and step < train_cfg.caption_warmup_steps
+    )
+    if caption_warmup_active and is_main_process:
+        print(
+            "Caption warmup active: non-caption gradients will be cleared for the first "
+            f"{train_cfg.caption_warmup_steps} optimizer steps."
+        )
 
     try:
         model.train()
@@ -1509,12 +2032,24 @@ def main() -> None:
                 accum_micro_steps += 1
                 text_ids = batch["text_ids"].to(device, non_blocking=True)
                 text_mask = batch["text_mask"].to(device, non_blocking=True)
+                caption_ids = None
+                caption_mask = None
+                has_caption = None
+                if raw_model.cfg.use_caption_condition:
+                    caption_ids = batch["caption_ids"].to(device, non_blocking=True)
+                    caption_mask = batch["caption_mask"].to(device, non_blocking=True)
+                    has_caption = batch["has_caption"].to(device, non_blocking=True)
                 x0 = batch["latent_patched"].to(device, non_blocking=True)
                 x_mask = batch["latent_mask_patched"].to(device, non_blocking=True)
                 x_mask_valid = batch["latent_mask_valid_patched"].to(device, non_blocking=True)
-                ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
-                ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
-                has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+                ref_latent = None
+                ref_mask = None
+                if raw_model.cfg.use_speaker_condition:
+                    ref_latent = batch["ref_latent_patched"].to(device, non_blocking=True)
+                    ref_mask = batch["ref_latent_mask_patched"].to(device, non_blocking=True)
+                    has_speaker = batch["has_speaker"].to(device, non_blocking=True)
+                else:
+                    has_speaker = None
 
                 bsz = x0.shape[0]
                 if train_cfg.timestep_stratified:
@@ -1543,13 +2078,25 @@ def main() -> None:
                 if text_cond_drop.any():
                     text_mask = text_mask.clone()
                     text_mask[text_cond_drop] = False
+                caption_cond_drop = None
+                if raw_model.cfg.use_caption_condition:
+                    if has_caption is None or caption_mask is None:
+                        raise RuntimeError(
+                            "Caption conditioning is enabled but caption batch tensors are missing."
+                        )
+                    caption_cond_drop = (
+                        torch.rand(bsz, device=device) < train_cfg.caption_condition_dropout
+                    )
+                    use_caption = has_caption & (~caption_cond_drop)
+                    caption_mask = caption_mask & use_caption[:, None]
 
-                speaker_cond_drop = (
-                    torch.rand(bsz, device=device) < train_cfg.speaker_condition_dropout
-                )
-                use_speaker = has_speaker & (~speaker_cond_drop)
-                ref_mask = ref_mask & use_speaker[:, None]
-                ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
+                if raw_model.cfg.use_speaker_condition:
+                    speaker_cond_drop = (
+                        torch.rand(bsz, device=device) < train_cfg.speaker_condition_dropout
+                    )
+                    use_speaker = has_speaker & (~speaker_cond_drop)
+                    ref_mask = ref_mask & use_speaker[:, None]
+                    ref_latent = ref_latent * use_speaker[:, None, None].to(ref_latent.dtype)
 
                 should_step = (accum_micro_steps % accum_steps) == 0
                 sync_context = model.no_sync() if distributed and not should_step else nullcontext()
@@ -1566,7 +2113,12 @@ def main() -> None:
                             text_mask=text_mask,
                             ref_latent=ref_latent,
                             ref_mask=ref_mask,
+                            caption_input_ids=caption_ids,
+                            caption_mask=caption_mask,
                             latent_mask=x_mask,
+                            text_condition_dropout=None,
+                            speaker_condition_dropout=None,
+                            caption_condition_dropout=None,
                         )
 
                     v_pred = v_pred.float()
@@ -1578,6 +2130,8 @@ def main() -> None:
                     )
                     loss = rf_loss
                     (loss / float(accum_steps)).backward()
+                    if caption_warmup_active:
+                        clear_non_caption_grads(raw_model)
 
                 accum_loss += loss.detach()
                 accum_rf_loss += rf_loss.detach()
@@ -1596,6 +2150,10 @@ def main() -> None:
                     scheduler.step()
                 step += 1
                 progress.update(step)
+                if caption_warmup_active and step >= train_cfg.caption_warmup_steps:
+                    caption_warmup_active = False
+                    if is_main_process:
+                        progress.write("caption warmup complete; all parameters are now updating.")
 
                 if step % train_cfg.log_every == 0:
                     loss_value = reduce_mean(step_loss, world_size, distributed).item()

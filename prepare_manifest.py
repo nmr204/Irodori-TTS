@@ -172,6 +172,7 @@ class _PreparedItem:
     idx: int
     status: str  # "ok", "skip", "error"
     text: str | None = None
+    caption: str | None = None
     wav: torch.Tensor | None = None
     sample_rate: int | None = None
     speaker_id: str | None = None
@@ -192,6 +193,10 @@ def _prepare_example(
         if args.text_normalize:
             text = normalize_text(text)
         text = text.strip()
+        caption = None
+        if args.caption_column is not None:
+            caption = _coerce_text(sample.get(args.caption_column, ""))
+            caption = caption.strip() or None
 
         if not text:
             return _PreparedItem(idx=idx, status="skip", skip_reason="empty_text")
@@ -237,6 +242,7 @@ def _prepare_example(
             idx=idx,
             status="ok",
             text=text,
+            caption=caption,
             wav=wav,
             sample_rate=sr,
             speaker_id=speaker_id,
@@ -502,6 +508,8 @@ def _run_worker(
         raise ValueError(f"audio column '{args.audio_column}' not found: {ds.column_names}")
     if args.text_column not in ds.column_names:
         raise ValueError(f"text column '{args.text_column}' not found: {ds.column_names}")
+    if args.caption_column is not None and args.caption_column not in ds.column_names:
+        raise ValueError(f"caption column '{args.caption_column}' not found: {ds.column_names}")
     if args.speaker_columns:
         missing_speaker_columns = [c for c in args.speaker_columns if c not in ds.column_names]
         if missing_speaker_columns:
@@ -632,6 +640,7 @@ def _run_worker(
         wav = item.wav
         sr = item.sample_rate
         text = item.text
+        caption = item.caption
         speaker_id = item.speaker_id
         if wav is None or sr is None or text is None:
             _inc_skip("prepare_error")
@@ -658,6 +667,8 @@ def _run_worker(
             "latent_path": latent_rel,
             "num_frames": int(latent.shape[0]),
         }
+        if caption is not None:
+            payload["caption"] = caption
         if speaker_id is not None:
             payload["speaker_id"] = speaker_id
         out_f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -761,6 +772,11 @@ def main() -> None:
             "Apply irodori_tts text normalization before writing manifest text. "
             "Use --no-text-normalize to keep raw text."
         ),
+    )
+    parser.add_argument(
+        "--caption-column",
+        default=None,
+        help="Optional caption/style-control text column name. Output manifest key is always 'caption'.",
     )
     parser.add_argument(
         "--speaker-column",
