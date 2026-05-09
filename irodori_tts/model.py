@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from .config import ModelConfig
 
@@ -30,7 +30,7 @@ def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
     freqs = 1000.0 * torch.exp(
         -torch.log(torch.tensor(10000.0, device=timestep.device, dtype=torch.float32))
         * torch.arange(half, device=timestep.device, dtype=torch.float32)
-        / half
+        / half,
     )
     args = timestep[:, None].float() * freqs[None, :]
     return torch.cat([torch.cos(args), torch.sin(args)], dim=-1).to(timestep.dtype)
@@ -52,9 +52,7 @@ class RMSNorm(nn.Module):
 
 
 class LowRankAdaLN(nn.Module):
-    """
-    Echo-style low-rank AdaLN that returns both modulated activations and a residual gate.
-    """
+    """Echo-style low-rank AdaLN that returns both modulated activations and a residual gate."""
 
     def __init__(self, model_dim: int, rank: int, eps: float):
         super().__init__()
@@ -78,7 +76,9 @@ class LowRankAdaLN(nn.Module):
             nn.init.zeros_(self.gate_up.bias)
 
     def forward(
-        self, x: torch.Tensor, cond_embed: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cond_embed: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         shift, scale, gate = cond_embed.chunk(3, dim=-1)
         shift = self.shift_up(self.shift_down(F.silu(shift))) + shift
@@ -98,8 +98,7 @@ def patch_sequence_with_mask(
     mask: torch.Tensor,
     patch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Patch along sequence axis:
+    """Patch along sequence axis:
       seq: (B, S, D) -> (B, S//patch, D*patch)
       mask: (B, S) -> (B, S//patch) with all() over patch window.
 
@@ -108,23 +107,24 @@ def patch_sequence_with_mask(
       latent-patched space (D = latent_dim * latent_patch_size).
       This helper applies an additional sequence patching for
       `speaker_patch_size`.
+
     """
     if patch_size <= 1:
         return seq, mask
     if seq.ndim != 3 or mask.ndim != 2:
         raise ValueError(
-            f"Expected seq=(B,S,D), mask=(B,S), got seq={tuple(seq.shape)} mask={tuple(mask.shape)}"
+            f"Expected seq=(B,S,D), mask=(B,S), got seq={tuple(seq.shape)} mask={tuple(mask.shape)}",
         )
     if seq.shape[0] != mask.shape[0] or seq.shape[1] != mask.shape[1]:
         raise ValueError(
             f"Sequence/mask shape mismatch: seq={tuple(seq.shape)}, mask={tuple(mask.shape)}. "
-            "Expected matching (B,S)."
+            "Expected matching (B,S).",
         )
     bsz, seq_len, dim = seq.shape
     usable = (seq_len // patch_size) * patch_size
     if usable <= 0:
         raise ValueError(
-            f"Reference sequence too short for speaker_patch_size={patch_size}: seq_len={seq_len}"
+            f"Reference sequence too short for speaker_patch_size={patch_size}: seq_len={seq_len}",
         )
     seq = seq[:, :usable].reshape(bsz, usable // patch_size, dim * patch_size)
     mask = mask[:, :usable].reshape(bsz, usable // patch_size, patch_size).all(dim=-1)
@@ -185,9 +185,7 @@ class SelfAttention(nn.Module):
 
 
 class JointAttention(nn.Module):
-    """
-    Echo-style joint attention over latent self tokens + conditioning contexts.
-    """
+    """Echo-style joint attention over latent self tokens + conditioning contexts."""
 
     def __init__(
         self,
@@ -237,40 +235,50 @@ class JointAttention(nn.Module):
         speaker_context: torch.Tensor | None,
         caption_context: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        """
-        Precompute conditioning KV projections for static conditioning.
-        """
+        """Precompute conditioning KV projections for static conditioning."""
         bsz = text_context.shape[0]
         k_text = self.wk_text(text_context).reshape(
-            bsz, text_context.shape[1], self.heads, self.head_dim
+            bsz,
+            text_context.shape[1],
+            self.heads,
+            self.head_dim,
         )
         v_text = self.wv_text(text_context).reshape(
-            bsz, text_context.shape[1], self.heads, self.head_dim
+            bsz,
+            text_context.shape[1],
+            self.heads,
+            self.head_dim,
         )
         k_text = self.k_norm(k_text)
         projected: list[torch.Tensor] = [k_text, v_text]
         if self.has_speaker_condition:
             if speaker_context is None:
                 raise ValueError(
-                    "speaker_context is required when speaker conditioning is enabled."
+                    "speaker_context is required when speaker conditioning is enabled.",
                 )
             if speaker_context.shape[0] != bsz:
                 raise ValueError(
                     "Batch mismatch for context projection: "
-                    f"text={tuple(text_context.shape)} speaker={tuple(speaker_context.shape)}"
+                    f"text={tuple(text_context.shape)} speaker={tuple(speaker_context.shape)}",
                 )
             k_speaker = self.wk_speaker(speaker_context).reshape(
-                bsz, speaker_context.shape[1], self.heads, self.head_dim
+                bsz,
+                speaker_context.shape[1],
+                self.heads,
+                self.head_dim,
             )
             v_speaker = self.wv_speaker(speaker_context).reshape(
-                bsz, speaker_context.shape[1], self.heads, self.head_dim
+                bsz,
+                speaker_context.shape[1],
+                self.heads,
+                self.head_dim,
             )
             k_speaker = self.k_norm(k_speaker)
             projected.extend([k_speaker, v_speaker])
         elif speaker_context is not None and speaker_context.shape[0] != bsz:
             raise ValueError(
                 "Batch mismatch for ignored speaker context: "
-                f"text={tuple(text_context.shape)} speaker={tuple(speaker_context.shape)}"
+                f"text={tuple(text_context.shape)} speaker={tuple(speaker_context.shape)}",
             )
         if not self.has_caption_condition:
             return tuple(projected)
@@ -279,13 +287,19 @@ class JointAttention(nn.Module):
         if caption_context.shape[0] != bsz:
             raise ValueError(
                 "Batch mismatch for caption context projection: "
-                f"text={tuple(text_context.shape)} caption={tuple(caption_context.shape)}"
+                f"text={tuple(text_context.shape)} caption={tuple(caption_context.shape)}",
             )
         k_caption = self.wk_caption(caption_context).reshape(
-            bsz, caption_context.shape[1], self.heads, self.head_dim
+            bsz,
+            caption_context.shape[1],
+            self.heads,
+            self.head_dim,
         )
         v_caption = self.wv_caption(caption_context).reshape(
-            bsz, caption_context.shape[1], self.heads, self.head_dim
+            bsz,
+            caption_context.shape[1],
+            self.heads,
+            self.head_dim,
         )
         k_caption = self.k_norm(k_caption)
         projected.extend([k_caption, v_caption])
@@ -350,7 +364,7 @@ class JointAttention(nn.Module):
         if self.has_speaker_condition:
             if speaker_context is None or k_speaker is None or v_speaker is None:
                 raise ValueError(
-                    "speaker_context is required when speaker conditioning is enabled."
+                    "speaker_context is required when speaker conditioning is enabled.",
                 )
             if speaker_mask is None:
                 speaker_mask = torch.ones(
@@ -364,7 +378,7 @@ class JointAttention(nn.Module):
         if self.has_caption_condition:
             if caption_context is None:
                 raise ValueError(
-                    "caption_context is required when caption conditioning is enabled."
+                    "caption_context is required when caption conditioning is enabled.",
                 )
             if caption_mask is None:
                 caption_mask = torch.ones(
@@ -374,7 +388,7 @@ class JointAttention(nn.Module):
                 )
             if k_caption is None or v_caption is None:
                 raise RuntimeError(
-                    "Caption projections are missing despite enabled caption conditioning."
+                    "Caption projections are missing despite enabled caption conditioning.",
                 )
             context_k.append(k_caption)
             context_v.append(v_caption)
@@ -419,7 +433,7 @@ class TextBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         x = x + self.dropout(
-            self.attention(self.attention_norm(x), key_mask=mask, freqs_cis=freqs_cis)
+            self.attention(self.attention_norm(x), key_mask=mask, freqs_cis=freqs_cis),
         )
         x = x + self.dropout(self.mlp(self.mlp_norm(x)))
         return x
@@ -451,7 +465,9 @@ class TextEncoder(nn.Module):
         )
         self.head_dim = dim // heads
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache",
+            torch.empty(0, 0, dtype=torch.complex64),
+            persistent=False,
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -474,9 +490,7 @@ class TextEncoder(nn.Module):
 
 
 class ReferenceLatentEncoder(nn.Module):
-    """
-    Encoder for reference latents used as speaker/style conditioning.
-    """
+    """Encoder for reference latents used as speaker/style conditioning."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -494,7 +508,9 @@ class ReferenceLatentEncoder(nn.Module):
         )
         self.head_dim = cfg.speaker_dim // cfg.speaker_heads
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache",
+            torch.empty(0, 0, dtype=torch.complex64),
+            persistent=False,
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -570,7 +586,7 @@ class DiffusionBlock(nn.Module):
                 freqs_cis=freqs_cis,
                 self_mask=self_mask,
                 context_kv=context_kv,
-            )
+            ),
         )
 
         h, mlp_gate = self.mlp_adaln(x, cond_embed)
@@ -579,8 +595,7 @@ class DiffusionBlock(nn.Module):
 
 
 class TextToLatentRFDiT(nn.Module):
-    """
-    Text + reference-latent conditioned RF diffusion model over patched DACVAE latent sequences.
+    """Text + reference-latent conditioned RF diffusion model over patched DACVAE latent sequences.
 
     Input x_t shape: (B, S, latent_dim * latent_patch_size)
     Output v_pred shape: same as input.
@@ -640,7 +655,9 @@ class TextToLatentRFDiT(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("model head_dim must be even for RoPE")
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache",
+            torch.empty(0, 0, dtype=torch.complex64),
+            persistent=False,
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -655,9 +672,7 @@ class TextToLatentRFDiT(nn.Module):
         state: torch.Tensor,
         mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Prepend one global summary token computed as masked mean over time.
-        """
+        """Prepend one global summary token computed as masked mean over time."""
         mask_f = mask.unsqueeze(-1).to(dtype=state.dtype)
         denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
         mean_token = (state * mask_f).sum(dim=1, keepdim=True) / denom
@@ -691,11 +706,11 @@ class TextToLatentRFDiT(nn.Module):
         if self.cfg.use_speaker_condition:
             if self.speaker_encoder is None or self.speaker_norm is None:
                 raise RuntimeError(
-                    "Speaker conditioning is enabled but speaker modules are missing."
+                    "Speaker conditioning is enabled but speaker modules are missing.",
                 )
             if ref_latent is None or ref_mask is None:
                 raise ValueError(
-                    "ref_latent and ref_mask are required when speaker conditioning is enabled."
+                    "ref_latent and ref_mask are required when speaker conditioning is enabled.",
                 )
             if speaker_condition_dropout is not None:
                 ref_mask = ref_mask.clone()
@@ -703,11 +718,11 @@ class TextToLatentRFDiT(nn.Module):
         if self.cfg.use_caption_condition:
             if self.caption_encoder is None or self.caption_norm is None:
                 raise RuntimeError(
-                    "Caption conditioning is enabled but caption modules are missing."
+                    "Caption conditioning is enabled but caption modules are missing.",
                 )
             if caption_input_ids is None or caption_mask is None:
                 raise ValueError(
-                    "caption_input_ids and caption_mask are required when caption conditioning is enabled."
+                    "caption_input_ids and caption_mask are required when caption conditioning is enabled.",
                 )
             if caption_condition_dropout is not None:
                 caption_mask = caption_mask.clone()
@@ -820,9 +835,7 @@ class TextToLatentRFDiT(nn.Module):
         speaker_state: torch.Tensor | None,
         caption_state: torch.Tensor | None = None,
     ) -> list[tuple[torch.Tensor, ...]]:
-        """
-        Build per-layer projected conditioning KV tensors for faster repeated sampling steps.
-        """
+        """Build per-layer projected conditioning KV tensors for faster repeated sampling steps."""
         return [
             block.attention.project_context_kv(
                 text_context=text_state,

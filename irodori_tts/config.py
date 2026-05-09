@@ -205,14 +205,12 @@ T = TypeVar("T")
 
 
 def load_experiment_yaml(path: str | Path) -> dict[str, Any]:
-    """
-    Load experiment config YAML. Returns {} for an empty document.
-    """
+    """Load experiment config YAML. Returns {} for an empty document."""
     try:
         import yaml
     except ImportError as exc:
         raise RuntimeError(
-            "PyYAML is required for --config support. Install with `pip install pyyaml`."
+            "PyYAML is required for --config support. Install with `pip install pyyaml`.",
         ) from exc
 
     payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
@@ -224,9 +222,7 @@ def load_experiment_yaml(path: str | Path) -> dict[str, Any]:
 
 
 def merge_dataclass_overrides(base: T, overrides: dict[str, Any] | None, section: str) -> T:
-    """
-    Merge mapping overrides into a dataclass instance with key validation.
-    """
+    """Merge mapping overrides into a dataclass instance with key validation."""
     if overrides is None:
         return base
     if not isinstance(overrides, dict):

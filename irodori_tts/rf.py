@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .model import TextToLatentRFDiT
@@ -34,8 +36,7 @@ def sample_stratified_logit_normal_t(
     t_min: float = 1e-3,
     t_max: float = 0.999,
 ) -> torch.Tensor:
-    """
-    Stratified sampling for logit-normal timesteps.
+    """Stratified sampling for logit-normal timesteps.
 
     u ~ stratified U(0, 1), z = mean + std * Phi^{-1}(u), t = sigmoid(z)
     """
@@ -77,9 +78,7 @@ def temporal_score_rescale(
     rescale_k: float,
     rescale_sigma: float,
 ) -> torch.Tensor:
-    """
-    Temporal score rescaling from https://arxiv.org/pdf/2510.01184.
-    """
+    """Temporal score rescaling from https://arxiv.org/pdf/2510.01184."""
     t_value = float(t.item()) if isinstance(t, torch.Tensor) else float(t)
     if t_value >= 1.0:
         return v_pred
@@ -95,9 +94,7 @@ def scale_speaker_kv_cache(
     scale: float,
     max_layers: int | None = None,
 ) -> None:
-    """
-    In-place scaling of speaker K/V tensors in precomputed context cache.
-    """
+    """In-place scaling of speaker K/V tensors in precomputed context cache."""
     if max_layers is None:
         n_layers = len(context_kv_cache)
     else:
@@ -106,7 +103,7 @@ def scale_speaker_kv_cache(
         layer_kv = context_kv_cache[i]
         if len(layer_kv) < 4:
             raise ValueError(
-                f"Expected at least 4 tensors in context KV cache entry, got {len(layer_kv)}"
+                f"Expected at least 4 tensors in context KV cache entry, got {len(layer_kv)}",
             )
         k_speaker = layer_kv[2]
         v_speaker = layer_kv[3]
@@ -140,12 +137,14 @@ def sample_euler_rf_cfg(
     speaker_kv_scale: float | None = None,
     speaker_kv_max_layers: int | None = None,
     speaker_kv_min_t: float | None = None,
+    t_schedule_mode: str = "linear",
+    sway_coeff: float = -1.0,
 ) -> torch.Tensor:
-    """
-    Euler sampling over RF ODE with text/reference/caption conditioning CFG.
+    """Euler sampling over RF ODE with text/reference/caption conditioning CFG.
 
     Returns:
       latent sequence in patched space, shape (B, sequence_length, patched_latent_dim)
+
     """
     device = model.device
     dtype = model.dtype
@@ -154,7 +153,10 @@ def sample_euler_rf_cfg(
 
     rng, rng_device = _make_rng(seed=seed, device=device)
     x_t = torch.randn(
-        (batch_size, sequence_length, latent_dim), device=rng_device, dtype=dtype, generator=rng
+        (batch_size, sequence_length, latent_dim),
+        device=rng_device,
+        dtype=dtype,
+        generator=rng,
     )
     if rng_device != device:
         x_t = x_t.to(device=device)
@@ -174,11 +176,24 @@ def sample_euler_rf_cfg(
     if cfg_guidance_mode not in {"independent", "joint", "alternating"}:
         raise ValueError(
             f"Unsupported cfg_guidance_mode={cfg_guidance_mode!r}. "
-            "Expected one of: independent, joint, alternating."
+            "Expected one of: independent, joint, alternating.",
         )
 
     init_scale = 0.999
-    t_schedule = torch.linspace(1.0, 0.0, num_steps + 1, device=device) * init_scale
+    t_schedule_mode_norm = str(t_schedule_mode).strip().lower()
+    if t_schedule_mode_norm == "linear":
+        u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+    elif t_schedule_mode_norm == "sway":
+        # F5-TTS-style Sway Sampling. Negative sway_coeff densifies the noise
+        # side of the schedule (early steps); positive densifies the data side.
+        u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        u = u + float(sway_coeff) * (torch.cos(0.5 * math.pi * u) + u - 1.0)
+        u = u.clamp(0.0, 1.0)
+    else:
+        raise ValueError(
+            f"Unsupported t_schedule_mode={t_schedule_mode!r}. Expected 'linear' or 'sway'.",
+        )
+    t_schedule = (1.0 - u) * init_scale
     use_independent_cfg = cfg_guidance_mode == "independent"
     use_joint_cfg = cfg_guidance_mode == "joint"
     use_alternating_cfg = cfg_guidance_mode == "alternating"
@@ -205,7 +220,7 @@ def sample_euler_rf_cfg(
     if model.cfg.use_speaker_condition:
         if speaker_state_cond is None or speaker_mask_cond is None:
             raise RuntimeError(
-                "Speaker conditioning is enabled but encoded speaker state is missing."
+                "Speaker conditioning is enabled but encoded speaker state is missing.",
             )
         speaker_state_uncond = torch.zeros_like(speaker_state_cond)
         speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
@@ -214,7 +229,7 @@ def sample_euler_rf_cfg(
     if model.cfg.use_caption_condition:
         if caption_state_cond is None or caption_mask_cond is None:
             raise RuntimeError(
-                "Caption conditioning is enabled but encoded caption state is missing."
+                "Caption conditioning is enabled but encoded caption state is missing.",
             )
         caption_state_uncond = torch.zeros_like(caption_state_cond)
         caption_mask_uncond = torch.zeros_like(caption_mask_cond)
@@ -294,7 +309,7 @@ def sample_euler_rf_cfg(
                     caption_mask_val=(
                         caption_mask_uncond if name == "caption" else caption_mask_cond
                     ),
-                )
+                ),
             )
     cfg_batch_mult = len(independent_bundles)
 
@@ -457,7 +472,7 @@ def sample_euler_rf_cfg(
                         if max(joint_scales) - min(joint_scales) > 1e-6:
                             raise ValueError(
                                 "cfg_guidance_mode='joint' expects equal enabled guidance scales; "
-                                "set matching text/speaker/caption scales or use --cfg-scale."
+                                "set matching text/speaker/caption scales or use --cfg-scale.",
                             )
                     joint_scale = cfg_scales[enabled_cfg_names[0]]
                     v_uncond_joint = model.forward_with_encoded_conditions(

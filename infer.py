@@ -27,7 +27,7 @@ def _parse_optional_float(value: str) -> float | None:
         out = float(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "Expected float or one of [none, null, off, disable, disabled]."
+            "Expected float or one of [none, null, off, disable, disabled].",
         ) from exc
     if not math.isfinite(out):
         raise argparse.ArgumentTypeError(f"Expected finite float for value={value!r}.")
@@ -310,10 +310,14 @@ def main() -> None:
     )
     ref_group = parser.add_mutually_exclusive_group(required=False)
     ref_group.add_argument(
-        "--ref-wav", default=None, help="Reference waveform path for speaker conditioning."
+        "--ref-wav",
+        default=None,
+        help="Reference waveform path for speaker conditioning.",
     )
     ref_group.add_argument(
-        "--ref-latent", default=None, help="Reference latent (.pt) path for speaker conditioning."
+        "--ref-latent",
+        default=None,
+        help="Reference latent (.pt) path for speaker conditioning.",
     )
     ref_group.add_argument(
         "--no-ref",
@@ -337,13 +341,13 @@ def main() -> None:
             enable_watermark=bool(args.enable_watermark),
             compile_model=bool(args.compile_model),
             compile_dynamic=bool(args.compile_dynamic),
-        )
+        ),
     )
     if runtime.model_cfg.use_speaker_condition and not (
         args.no_ref or args.ref_wav is not None or args.ref_latent is not None
     ):
         parser.error(
-            "speaker-conditioned checkpoints require one of --ref-wav, --ref-latent, or --no-ref."
+            "speaker-conditioned checkpoints require one of --ref-wav, --ref-latent, or --no-ref.",
         )
     cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
         cfg_guidance_mode=str(args.cfg_guidance_mode),
@@ -354,7 +358,7 @@ def main() -> None:
         use_caption_condition=bool(
             runtime.model_cfg.use_caption_condition
             and args.caption is not None
-            and str(args.caption).strip() != ""
+            and str(args.caption).strip() != "",
         ),
         use_speaker_condition=bool(runtime.model_cfg.use_speaker_condition),
     )
@@ -416,7 +420,7 @@ def main() -> None:
         print(f"Saved: {out_path}")
     else:
         base_path = Path(str(args.output_wav))
-        suffix = base_path.suffix if base_path.suffix else ".wav"
+        suffix = base_path.suffix or ".wav"
         for i, audio in enumerate(result.audios, start=1):
             out_path = base_path.with_name(f"{base_path.stem}_{i:03d}{suffix}")
             saved = save_wav(out_path, audio, result.sample_rate)

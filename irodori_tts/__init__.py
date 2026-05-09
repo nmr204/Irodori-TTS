@@ -6,8 +6,8 @@ from .model import TextToLatentRFDiT
 from .tokenizer import ByteTokenizer, PretrainedTextTokenizer
 
 __all__ = [
-    "ByteTokenizer",
     "LORA_TARGET_PRESETS",
+    "ByteTokenizer",
     "ModelConfig",
     "PretrainedTextTokenizer",
     "SamplingConfig",

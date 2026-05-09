@@ -17,7 +17,6 @@ from safetensors.torch import load_file as load_safetensors_file
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
-from .lora import checkpoint_state_uses_lora
 from .model import TextToLatentRFDiT
 from .rf import sample_euler_rf_cfg
 from .text_normalization import normalize_text
@@ -108,7 +107,7 @@ def _coerce_latent_shape(latent: torch.Tensor, latent_dim: int) -> torch.Tensor:
     if latent.shape[0] == latent_dim:
         return latent.transpose(0, 1).contiguous()
     raise ValueError(
-        f"Could not infer latent layout for shape={tuple(latent.shape)} and latent_dim={latent_dim}"
+        f"Could not infer latent layout for shape={tuple(latent.shape)} and latent_dim={latent_dim}",
     )
 
 
@@ -119,13 +118,14 @@ def find_flattening_point(
     std_threshold: float = 0.05,
     mean_threshold: float = 0.1,
 ) -> int:
-    """
-    Echo-style heuristic: find first index where a trailing window becomes near-flat and near-zero.
+    """Echo-style heuristic: find first index where a trailing window becomes near-flat and near-zero.
 
     Args:
       latent: (T, D) latent sequence.
+
     Returns:
       Flattening index in [0, T].
+
     """
     if latent.ndim != 2:
         raise ValueError(f"Expected latent shape (T, D), got {tuple(latent.shape)}")
@@ -194,6 +194,8 @@ class SamplingRequest:
     speaker_kv_min_t: float | None = None
     speaker_kv_max_layers: int | None = None
     seed: int | None = None
+    t_schedule_mode: str = "linear"
+    sway_coeff: float = -1.0
     trim_tail: bool = True
     tail_window_size: int = 20
     tail_std_threshold: float = 0.05
@@ -265,7 +267,7 @@ def resolve_cfg_scales(
     if not use_speaker_condition:
         if speaker_val > 0.0:
             messages.append(
-                "info: speaker conditioning is disabled for this checkpoint; ignoring cfg_scale_speaker."
+                "info: speaker conditioning is disabled for this checkpoint; ignoring cfg_scale_speaker.",
             )
         speaker_val = 0.0
 
@@ -276,7 +278,7 @@ def resolve_cfg_scales(
     if mode == "joint" and enabled_vals and (max(enabled_vals) - min(enabled_vals) > 1e-6):
         raise ValueError(
             "cfg_guidance_mode='joint' requires equal enabled cfg_scale_text/cfg_scale_caption/cfg_scale_speaker, "
-            "or set cfg_scale."
+            "or set cfg_scale.",
         )
 
     return text_val, caption_val, speaker_val, messages
@@ -306,10 +308,6 @@ def _load_checkpoint_from_pt(path: Path) -> tuple[dict[str, torch.Tensor], dict,
     if train_cfg is not None and not isinstance(train_cfg, dict):
         raise ValueError(f"Checkpoint train_config must be a dictionary when present: {path}")
 
-    if checkpoint_state_uses_lora(model_state):
-        raise ValueError(
-            f"LoRA checkpoints must be loaded from adapter directories or merged safetensors: {path}"
-        )
     return model_state, model_cfg, _extract_inference_train_config(train_cfg)
 
 
@@ -356,7 +354,7 @@ def _split_flat_checkpoint_config(path: Path, flat_config: dict) -> tuple[dict, 
         if key in _INFERENCE_CONFIG_KEYS:
             if not isinstance(value, int):
                 raise ValueError(
-                    f"Inference config key '{key}' must be int in checkpoint metadata: {path}"
+                    f"Inference config key '{key}' must be int in checkpoint metadata: {path}",
                 )
             inference_cfg[key] = int(value)
             continue
@@ -431,7 +429,7 @@ class InferenceRuntime:
         )
 
         model_state, model_cfg_dict, train_cfg = _load_checkpoint_for_inference(
-            Path(key.checkpoint)
+            Path(key.checkpoint),
         )
         model_cfg = ModelConfig(**model_cfg_dict)
 
@@ -453,7 +451,7 @@ class InferenceRuntime:
         if tokenizer.vocab_size != model_cfg.text_vocab_size:
             raise ValueError(
                 f"text_vocab_size mismatch: checkpoint text_vocab_size={model_cfg.text_vocab_size} but tokenizer "
-                f"({model_cfg.text_tokenizer_repo}) vocab_size={tokenizer.vocab_size}."
+                f"({model_cfg.text_tokenizer_repo}) vocab_size={tokenizer.vocab_size}.",
             )
         caption_tokenizer = None
         if model_cfg.use_caption_condition:
@@ -465,7 +463,7 @@ class InferenceRuntime:
             if caption_tokenizer.vocab_size != model_cfg.caption_vocab_size_resolved:
                 raise ValueError(
                     f"caption_vocab_size mismatch: checkpoint caption_vocab_size={model_cfg.caption_vocab_size_resolved} but tokenizer ({model_cfg.caption_tokenizer_repo_resolved}) "
-                    f"vocab_size={caption_tokenizer.vocab_size}."
+                    f"vocab_size={caption_tokenizer.vocab_size}.",
                 )
 
         default_text_max_len = 256
@@ -491,7 +489,7 @@ class InferenceRuntime:
         if model_cfg.latent_dim != codec.latent_dim:
             raise ValueError(
                 f"Latent dimension mismatch: checkpoint latent_dim={model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
-                "Use a compatible codec/checkpoint pair."
+                "Use a compatible codec/checkpoint pair.",
             )
 
         return cls(
@@ -517,7 +515,7 @@ class InferenceRuntime:
         if not self.model_cfg.use_speaker_condition:
             if req.ref_wav is not None or req.ref_latent is not None:
                 messages.append(
-                    "info: speaker conditioning is disabled for this checkpoint; ignoring reference input."
+                    "info: speaker conditioning is disabled for this checkpoint; ignoring reference input.",
                 )
             return None, None
         if req.no_ref:
@@ -532,7 +530,9 @@ class InferenceRuntime:
                 dtype=runtime_dtype,
             )
             ref_mask = torch.zeros(
-                (batch_size, ref_len), dtype=torch.bool, device=self.model_device
+                (batch_size, ref_len),
+                dtype=torch.bool,
+                device=self.model_device,
             )
             return ref_latent_patched, ref_mask
 
@@ -546,14 +546,15 @@ class InferenceRuntime:
                 math.ceil(
                     float(req.max_ref_seconds)
                     * float(self.codec.sample_rate)
-                    / float(int(self.codec.model.hop_length))
+                    / float(int(self.codec.model.hop_length)),
                 ),
             )
 
         if req.ref_latent is not None:
             latent_raw = torch.load(req.ref_latent, map_location="cpu", weights_only=True)
             ref_latent = _coerce_latent_shape(
-                latent_raw, latent_dim=self.model_cfg.latent_dim
+                latent_raw,
+                latent_dim=self.model_cfg.latent_dim,
             ).unsqueeze(0)
             ref_latent = ref_latent.to(dtype=runtime_dtype)
         else:
@@ -563,12 +564,12 @@ class InferenceRuntime:
                 if wav.shape[1] > max_ref_samples:
                     messages.append(
                         f"warning: reference audio exceeds max_ref_seconds ({req.max_ref_seconds}s). "
-                        f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                        f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s.",
                     )
                     wav = wav[:, :max_ref_samples]
             if req.ref_normalize_db is not None:
                 messages.append(
-                    f"info: reference loudness normalize enabled (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
+                    f"info: reference loudness normalize enabled (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling).",
                 )
             elif req.ref_ensure_max:
                 messages.append("info: reference peak safety scaling enabled (ensure_max=True).")
@@ -582,21 +583,23 @@ class InferenceRuntime:
         if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
             messages.append(
                 f"warning: reference latent steps ({ref_latent.shape[1]}) exceed max_ref_seconds bound ({max_ref_latent_steps} steps). "
-                "Trimming reference latent."
+                "Trimming reference latent.",
             )
             ref_latent = ref_latent[:, :max_ref_latent_steps]
 
         ref_latent_patched = patchify_latent(ref_latent, self.model_cfg.latent_patch_size).to(
-            self.model_device
+            self.model_device,
         )
         if ref_latent_patched.shape[1] == 0:
             raise ValueError(
-                "Reference latent length became zero after patchify. Use longer reference audio."
+                "Reference latent length became zero after patchify. Use longer reference audio.",
             )
         if batch_size > 1:
             ref_latent_patched = ref_latent_patched.repeat(batch_size, 1, 1)
         ref_mask = torch.ones(
-            (batch_size, ref_latent_patched.shape[1]), dtype=torch.bool, device=self.model_device
+            (batch_size, ref_latent_patched.shape[1]),
+            dtype=torch.bool,
+            device=self.model_device,
         )
         return ref_latent_patched, ref_mask
 
@@ -628,7 +631,7 @@ class InferenceRuntime:
                 "random" if req.seed is None else int(req.seed),
                 req.num_candidates,
                 req.decode_mode,
-            )
+            ),
         )
 
         if req.seconds <= 0:
@@ -639,7 +642,7 @@ class InferenceRuntime:
         decode_mode = str(req.decode_mode).strip().lower()
         if decode_mode not in {"sequential", "batch"}:
             raise ValueError(
-                f"Unsupported decode_mode={req.decode_mode!r}. Expected one of: sequential, batch."
+                f"Unsupported decode_mode={req.decode_mode!r}. Expected one of: sequential, batch.",
             )
 
         raw_text = str(req.text)
@@ -662,7 +665,7 @@ class InferenceRuntime:
         has_caption_text = bool(
             self.model_cfg.use_caption_condition
             and req.caption is not None
-            and str(req.caption).strip() != ""
+            and str(req.caption).strip() != "",
         )
 
         truncation_factor = None if req.truncation_factor is None else float(req.truncation_factor)
@@ -685,7 +688,7 @@ class InferenceRuntime:
         if speaker_kv_scale is not None:
             if not self.model_cfg.use_speaker_condition:
                 messages.append(
-                    "info: speaker conditioning is disabled for this checkpoint; ignoring speaker_kv_scale."
+                    "info: speaker conditioning is disabled for this checkpoint; ignoring speaker_kv_scale.",
                 )
                 speaker_kv_scale = None
             else:
@@ -698,14 +701,14 @@ class InferenceRuntime:
                     raise ValueError(f"speaker_kv_min_t must be in [0, 1], got {speaker_kv_min_t}")
                 if speaker_kv_max_layers is not None and speaker_kv_max_layers < 0:
                     raise ValueError(
-                        f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}"
+                        f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}",
                     )
 
         cfg_mode = str(req.cfg_guidance_mode).strip().lower()
         if cfg_mode not in {"independent", "joint", "alternating"}:
             raise ValueError(
                 f"Unsupported cfg_guidance_mode={req.cfg_guidance_mode!r}. "
-                "Expected one of: independent, joint, alternating."
+                "Expected one of: independent, joint, alternating.",
             )
 
         cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
@@ -748,7 +751,7 @@ class InferenceRuntime:
             if self.model_cfg.use_caption_condition:
                 if self.caption_tokenizer is None:
                     raise RuntimeError(
-                        "Caption conditioning is enabled but caption tokenizer is not loaded."
+                        "Caption conditioning is enabled but caption tokenizer is not loaded.",
                     )
                 caption_text = "" if req.caption is None else str(req.caption).strip()
                 caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
@@ -812,6 +815,8 @@ class InferenceRuntime:
                 speaker_kv_scale=speaker_kv_scale,
                 speaker_kv_max_layers=speaker_kv_max_layers,
                 speaker_kv_min_t=speaker_kv_min_t,
+                t_schedule_mode=str(req.t_schedule_mode),
+                sway_coeff=float(req.sway_coeff),
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf", stage_sec))
@@ -843,7 +848,7 @@ class InferenceRuntime:
                             mean_threshold=float(req.tail_mean_threshold),
                         )
                         flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
+                            flattening_point * int(self.codec.model.hop_length),
                         )
                         if flattening_samples > 0:
                             max_samples = min(max_samples, flattening_samples)
@@ -860,7 +865,7 @@ class InferenceRuntime:
                             mean_threshold=float(req.tail_mean_threshold),
                         )
                         flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
+                            flattening_point * int(self.codec.model.hop_length),
                         )
                         if flattening_samples > 0:
                             max_samples = min(max_samples, flattening_samples)
@@ -905,7 +910,7 @@ _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
 def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
     global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
     with _RUNTIME_CACHE_LOCK:
-        if _RUNTIME_CACHE_VALUE is not None and _RUNTIME_CACHE_KEY == key:
+        if _RUNTIME_CACHE_VALUE is not None and key == _RUNTIME_CACHE_KEY:
             return _RUNTIME_CACHE_VALUE, False
 
         old_runtime = _RUNTIME_CACHE_VALUE

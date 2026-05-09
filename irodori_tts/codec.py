@@ -12,8 +12,7 @@ _CODEC_DEFAULT = object()
 
 
 def patchify_latent(latent: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """
-    Convert latent from (B, T, D) -> (B, T//patch, D*patch).
+    """Convert latent from (B, T, D) -> (B, T//patch, D*patch).
     Extra tail tokens are dropped.
     """
     if patch_size <= 1:
@@ -26,9 +25,7 @@ def patchify_latent(latent: torch.Tensor, patch_size: int) -> torch.Tensor:
 
 
 def unpatchify_latent(patched: torch.Tensor, patch_size: int, latent_dim: int) -> torch.Tensor:
-    """
-    Convert latent from (B, T_p, D*patch) -> (B, T_p*patch, D).
-    """
+    """Convert latent from (B, T_p, D*patch) -> (B, T_p*patch, D)."""
     if patch_size <= 1:
         return patched
     return patched.reshape(patched.shape[0], patched.shape[1] * patch_size, latent_dim)
@@ -69,8 +66,7 @@ class DACVAECodec:
             from dacvae import DACVAE
 
         location = str(repo_id).strip()
-        if location.startswith("hf://"):
-            location = location[len("hf://") :]
+        location = location.removeprefix("hf://")
         if not Path(location).exists() and "/" in location and not location.endswith(".pth"):
             try:
                 location = hf_hub_download(repo_id=location, filename="weights.pth")
@@ -147,7 +143,9 @@ class DACVAECodec:
 
     @staticmethod
     def _normalize_loudness(
-        wav: torch.Tensor, sample_rate: int, target_db: float | None
+        wav: torch.Tensor,
+        sample_rate: int,
+        target_db: float | None,
     ) -> torch.Tensor:
         if target_db is None:
             return wav
@@ -163,7 +161,7 @@ class DACVAECodec:
         if wav.ndim != 1:
             raise ValueError(
                 "normalize_loudness expects a mono waveform with shape (T,) "
-                f"or singleton-channel (1, T)/(T, 1), got {tuple(wav.shape)}"
+                f"or singleton-channel (1, T)/(T, 1), got {tuple(wav.shape)}",
             )
 
         try:
@@ -171,7 +169,7 @@ class DACVAECodec:
         except Exception as exc:
             raise RuntimeError(
                 "audiotools is required when normalize_db is set. "
-                "Install audiotools or disable normalize_db."
+                "Install audiotools or disable normalize_db.",
             ) from exc
 
         signal = AudioSignal(wav.unsqueeze(0).unsqueeze(0), int(sample_rate))
@@ -185,7 +183,7 @@ class DACVAECodec:
         if normalized.ndim != 1:
             raise RuntimeError(
                 "audiotools normalization returned an unexpected waveform shape "
-                f"{tuple(normalized.shape)}"
+                f"{tuple(normalized.shape)}",
             )
         return normalized
 
@@ -198,8 +196,7 @@ class DACVAECodec:
         normalize_db: float | None | object = _CODEC_DEFAULT,
         ensure_max: bool | None = None,
     ) -> torch.Tensor:
-        """
-        Input:
+        """Input:
           waveform: (B, C, T) or (C, T)
           normalize_db: Optional target loudness (LUFS-like dB) applied before encode
           ensure_max: If True and normalize_db is None, scale down only when abs peak exceeds 1.0
@@ -235,13 +232,15 @@ class DACVAECodec:
             for wav in waveform.squeeze(1):
                 if effective_normalize_db is not None:
                     wav = self._normalize_loudness(
-                        wav, sample_rate=self.sample_rate, target_db=effective_normalize_db
+                        wav,
+                        sample_rate=self.sample_rate,
+                        target_db=effective_normalize_db,
                     )
                 wav = wav.squeeze()
                 if wav.ndim != 1:
                     raise RuntimeError(
                         "Expected mono per-item waveform after preprocessing, "
-                        f"got shape={tuple(wav.shape)}"
+                        f"got shape={tuple(wav.shape)}",
                     )
                 if effective_ensure_max:
                     peak = wav.abs().max()
@@ -260,7 +259,7 @@ class DACVAECodec:
             )
             if not required_paths_present:
                 raise RuntimeError(
-                    "deterministic_encode=True requires encoder/_pad/quantizer.in_proj on DACVAE model."
+                    "deterministic_encode=True requires encoder/_pad/quantizer.in_proj on DACVAE model.",
                 )
             z = self.model.encoder(self.model._pad(waveform))
             mean, _scale = self.model.quantizer.in_proj(z).chunk(2, dim=1)
@@ -271,8 +270,7 @@ class DACVAECodec:
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        """
-        Input:
+        """Input:
           latent: (B, T, D)
         Output:
           audio: (B, 1, samples)

@@ -15,7 +15,7 @@ class ByteTokenizer:
     def for_vocab_size(cls, text_vocab_size: int) -> "ByteTokenizer":
         if text_vocab_size < 256:
             raise ValueError(
-                f"text_vocab_size must be >= 256 for byte-level tokenization, got {text_vocab_size}"
+                f"text_vocab_size must be >= 256 for byte-level tokenization, got {text_vocab_size}",
             )
         # Reserve a dedicated BOS token outside UTF-8 byte range when possible.
         if text_vocab_size == 256:
@@ -47,8 +47,7 @@ class ByteTokenizer:
 
 
 class PretrainedTextTokenizer:
-    """
-    Hugging Face tokenizer wrapper for text conditioning.
+    """Hugging Face tokenizer wrapper for text conditioning.
     - right-padding for stable positional behavior
     - optional explicit BOS prepend
     """
@@ -65,7 +64,7 @@ class PretrainedTextTokenizer:
             else:
                 raise ValueError(
                     "Tokenizer has no pad_token_id (and no eos_token fallback). "
-                    "Set a pad token before training/inference."
+                    "Set a pad token before training/inference.",
                 )
 
         if self.add_bos and self.tokenizer.bos_token_id is None:
@@ -83,7 +82,7 @@ class PretrainedTextTokenizer:
         except ImportError as exc:
             raise RuntimeError(
                 "transformers is required for pretrained text tokenization. "
-                "Install with `pip install transformers sentencepiece`."
+                "Install with `pip install transformers sentencepiece`.",
             ) from exc
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -96,7 +95,7 @@ class PretrainedTextTokenizer:
 
     @property
     def vocab_size(self) -> int:
-        return int(len(self.tokenizer))
+        return len(self.tokenizer)
 
     @property
     def bos_token_id(self) -> int | None:
